@@ -20,12 +20,43 @@ class FirewallManager:
         self.system = platform.system().lower()
         self.active_rules = []
         
-        # Interface names
-        self.hotspot_interface = "wlan0"
-        self.internet_interface = "eth0"
-        self.hotspot_network = "192.168.4.0/24"
-        self.captive_portal_port = 8080
-        self.dns_port = 53
+        # Initialize from ConfigManager, with fallbacks
+        main_cfg = self.config_manager.get_config() # Get main configuration dictionary
+        # System config might also be relevant for some settings if structured that way
+        # system_cfg = self.config_manager.load_system_config()
+
+        # It's crucial that keys used here ('interface', 'hotspot_ip', etc.)
+        # are consistent with what's defined in config_manager.py's default_config.
+        self.hotspot_interface = main_cfg.get('interface', 'wlan0')
+        # 'internet_interface' is not typically in main_cfg; it's more of a system/runtime setting.
+        # For now, we'll keep a default or it should be passed explicitly to methods needing it.
+        self.internet_interface = main_cfg.get('internet_sharing_interface', 'eth0') # Example if it were in main_cfg
+        self.hotspot_network = main_cfg.get('ip_range', '192.168.4.0/24') # Should give CIDR
+
+        # Captive portal settings might be nested or top-level in config
+        cp_settings = main_cfg.get('captive_portal', {})
+        self.captive_portal_port = cp_settings.get('port', 8080) # Default if not in config
+
+        # dns_port is typically 53. If dnsmasq is used, it handles this.
+        # This attribute might be for rules allowing traffic TO dnsmasq on the hotspot IP.
+        self.dns_port = main_cfg.get('dns_port', 53) # Default if not in config
+
+        # Validate initial values from config
+        try:
+            self.hotspot_interface = self.validator.validate(self.hotspot_interface, 'interface', context="fw_mgr_init_hotspot_iface")
+            self.internet_interface = self.validator.validate(self.internet_interface, 'interface', context="fw_mgr_init_internet_iface")
+            # For hotspot_network (CIDR), 'user_input' is a basic check. A specific CIDR rule would be better.
+            self.hotspot_network = self.validator.validate(self.hotspot_network, 'user_input', context="fw_mgr_init_hotspot_network")
+            self.captive_portal_port = self.validator.validate(str(self.captive_portal_port), 'port', context="fw_mgr_init_cp_port")
+            self.dns_port = self.validator.validate(str(self.dns_port), 'port', context="fw_mgr_init_dns_port")
+        except ValidationError as e:
+            logging.critical(f"Initial firewall parameter validation failed during __init__: {e}. Using hardcoded fallbacks.")
+            # Fallback to truly hardcoded (but common) values if config is critically bad
+            self.hotspot_interface = "wlan0"
+            self.internet_interface = "eth0" # This is a common default but might not be correct
+            self.hotspot_network = "192.168.4.0/24"
+            self.captive_portal_port = 8080
+            self.dns_port = 53
     
     def setup_hotspot_firewall(self, hotspot_interface="wlan0", internet_interface="eth0"):
         """Setup firewall rules for hotspot operation"""
@@ -51,8 +82,12 @@ class FirewallManager:
                 
                 # NAT rules for internet sharing
                 ("iptables", ["-t", "nat", "-A", "POSTROUTING", "-o", self.internet_interface, "-j", "MASQUERADE"]),
+
+                # Allow established connections back to the hotspot interface
                 ("iptables", ["-A", "FORWARD", "-i", self.internet_interface, "-o", self.hotspot_interface, "-m", "state", "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT"]),
-                ("iptables", ["-A", "FORWARD", "-i", self.hotspot_interface, "-o", self.internet_interface, "-j", "ACCEPT"]),
+                # The rule allowing all traffic from hotspot_interface to internet_interface is removed.
+                # It will be replaced by a default DROP policy at the end of FORWARD chain setup for this interface,
+                # and specific client MACs will be allowed via allow_authenticated_device.
                 
                 # Allow DNS traffic
                 ("iptables", ["-A", "INPUT", "-i", self.hotspot_interface, "-p", "udp", "--dport", str(dns_port_val), "-j", "ACCEPT"]),
@@ -62,18 +97,22 @@ class FirewallManager:
                 ("iptables", ["-A", "INPUT", "-i", self.hotspot_interface, "-p", "udp", "--dport", "67", "-j", "ACCEPT"]),
                 ("iptables", ["-A", "INPUT", "-i", self.hotspot_interface, "-p", "udp", "--dport", "68", "-j", "ACCEPT"]),
                 
-                # Allow captive portal traffic
+                # Allow captive portal traffic (to the hotspot IP)
                 ("iptables", ["-A", "INPUT", "-i", self.hotspot_interface, "-p", "tcp", "--dport", str(captive_portal_port_val), "-j", "ACCEPT"]),
                 
                 # Allow SSH (optional, for management - static port)
                 ("iptables", ["-A", "INPUT", "-i", self.hotspot_interface, "-p", "tcp", "--dport", "22", "-j", "ACCEPT"]),
+
+                # Default policy for traffic from hotspot clients to the internet is DROP.
+                # Specific authenticated devices will be allowed by rules inserted at the top of FORWARD chain
+                # by allow_authenticated_device method.
+                # The REJECT rules for HTTP/HTTPS are removed as the DNAT rules for captive portal
+                # and the default FORWARD DROP will handle unauthenticated traffic.
+                ("iptables", ["-A", "FORWARD", "-i", self.hotspot_interface, "-o", self.internet_interface, "-j", "DROP"]),
                 
-                # Block direct internet access until authenticated (captive portal - static ports)
-                ("iptables", ["-A", "FORWARD", "-i", self.hotspot_interface, "-p", "tcp", "--dport", "80", "-j", "REJECT"]),
-                ("iptables", ["-A", "FORWARD", "-i", self.hotspot_interface, "-p", "tcp", "--dport", "443", "-j", "REJECT"]),
-                
-                # Drop other traffic by default
+                # Default INPUT policy for hotspot interface: Drop other incoming traffic
                 ("iptables", ["-A", "INPUT", "-i", self.hotspot_interface, "-j", "DROP"]),
+
             ]
             
             for command_type, args in rules:
@@ -91,22 +130,24 @@ class FirewallManager:
     
     def setup_captive_portal_redirect(self):
         """Setup iptables rules for captive portal redirection"""
-        # Assumes self.hotspot_interface and self.captive_portal_port are already validated or set from trusted source
+        # hotspot_interface, captive_portal_port, and dns_port are now instance variables,
+        # initialized and validated in __init__ or updated by setup_hotspot_firewall.
         try:
-            # Ensure ports are integers
-            captive_portal_port_val = self.validator.validate(str(self.captive_portal_port), 'port', context="fw_captive_redirect_port")
-            dns_port_val = self.validator.validate(str(self.dns_port), 'port', context="fw_dns_redirect_port")
-            # Assuming redirect IP '192.168.4.1' is static and trusted for the hotspot's gateway
-            redirect_ip = "192.168.4.1" # This should ideally come from config and be validated as ip_address
+            # Retrieve hotspot_ip from config_manager and validate it.
+            hotspot_ip_str = self.config_manager.config.get('hotspot_ip')
+            if not hotspot_ip_str:
+                logging.error("Hotspot IP ('hotspot_ip') not configured, cannot set up captive portal DNS/HTTP redirects.")
+                return False
+            validated_hotspot_ip = self.validator.validate(hotspot_ip_str, 'ip_address', context="fw_captive_redirect_hotspot_ip")
 
+            # Ports are already validated instance members (self.captive_portal_port, self.dns_port)
             # Redirect HTTP traffic to captive portal
             redirect_rules = [
-                ("iptables", ["-t", "nat", "-A", "PREROUTING", "-i", self.hotspot_interface, "-p", "tcp", "--dport", "80", "-j", "DNAT", "--to-destination", f"{redirect_ip}:{captive_portal_port_val}"]),
-                # ("iptables", ["-t", "nat", "-A", "PREROUTING", "-i", self.hotspot_interface, "-p", "tcp", "--dport", "8080", "-j", "DNAT", "--to-destination", f"{redirect_ip}:{captive_portal_port_val}"]), # Port 8080 is often the portal itself
+                ("iptables", ["-t", "nat", "-A", "PREROUTING", "-i", self.hotspot_interface, "-p", "tcp", "--dport", "80", "-j", "DNAT", "--to-destination", f"{validated_hotspot_ip}:{self.captive_portal_port}"]),
                 
-                # Redirect DNS queries to local DNS server
-                ("iptables", ["-t", "nat", "-A", "PREROUTING", "-i", self.hotspot_interface, "-p", "udp", "--dport", str(dns_port_val), "-j", "DNAT", f"--to-destination", f"{redirect_ip}:{dns_port_val}"]),
-                ("iptables", ["-t", "nat", "-A", "PREROUTING", "-i", self.hotspot_interface, "-p", "tcp", "--dport", str(dns_port_val), "-j", "DNAT", f"--to-destination", f"{redirect_ip}:{dns_port_val}"]),
+                # Redirect DNS queries to local DNS server (dnsmasq listening on hotspot_ip)
+                ("iptables", ["-t", "nat", "-A", "PREROUTING", "-i", self.hotspot_interface, "-p", "udp", "--dport", str(self.dns_port), "-j", "DNAT", f"--to-destination", f"{validated_hotspot_ip}:{self.dns_port}"]),
+                ("iptables", ["-t", "nat", "-A", "PREROUTING", "-i", self.hotspot_interface, "-p", "tcp", "--dport", str(self.dns_port), "-j", "DNAT", f"--to-destination", f"{validated_hotspot_ip}:{self.dns_port}"]),
             ]
             
             for command_type, args in redirect_rules:

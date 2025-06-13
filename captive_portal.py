@@ -17,10 +17,13 @@ import logging
 from input_validator import get_validator, ValidationError
 
 class CaptivePortal:
-    def __init__(self, config_manager, user_manager):
+    def __init__(self, config_manager, user_manager, firewall_manager):
         self.validator = get_validator()
         self.config_manager = config_manager
         self.user_manager = user_manager
+        self.firewall_manager = firewall_manager # Added
+        # Define lease path, ideally from config_manager or a shared constant
+        self.dnsmasq_lease_path = self.config_manager.config.get('dnsmasq_lease_file', "/tmp/hotterspot.leases")
         self.app = Flask(__name__)
         self.app.secret_key = os.urandom(24)
         self.server = None
@@ -84,9 +87,26 @@ class CaptivePortal:
                 return render_template_string(self.get_portal_template(error="You must accept the terms of service"), 
                                             hotspot_name=self.config_manager.get_config().get('hotspot_name', 'WiFi Hotspot'))
             
-            # Authenticate user
+            # Authenticate user (updates database)
             self.authenticate_device(mac_address, client_ip, user_agent)
             
+            # Update firewall to allow this device
+            if mac_address and not mac_address.startswith("unknown_"):
+                try:
+                    # Validate MAC one last time before passing to firewall manager
+                    validated_mac_for_fw = self.validator.validate(mac_address, 'mac_address', context="captive_portal_auth_firewall")
+                    success_fw = self.firewall_manager.allow_authenticated_device(validated_mac_for_fw)
+                    if success_fw:
+                        logging.info(f"Successfully updated firewall for authenticated device: {validated_mac_for_fw}")
+                    else:
+                        logging.error(f"Failed to update firewall for authenticated device: {validated_mac_for_fw}. Internet access may not be granted despite portal authentication.")
+                except ValidationError as ve:
+                    logging.error(f"Invalid MAC address '{mac_address}' for firewall update after authentication. Error: {ve}")
+                except Exception as e_fw:
+                    logging.error(f"An unexpected error occurred while updating firewall for {mac_address}: {e_fw}")
+            else:
+                logging.warning(f"Could not update firewall for device with unknown MAC (IP: {client_ip}). Device might not get internet access.")
+
             return redirect('/success')
         
         @self.app.route('/success')
@@ -113,24 +133,54 @@ class CaptivePortal:
             validated_ip = self.validator.validate(ip_address, 'ip_address', context="captive_portal_get_mac_ip")
         except ValidationError as e:
             logging.error(f"Invalid IP address received for MAC lookup: {ip_address}. Error: {e}")
-            return f"unknown_invalid_ip_{ip_address.replace('.', '_')}"
+            return f"unknown_invalid_ip_{ip_address.replace('.', '_')}" # Return after logging
 
+        # Priority 1: Parse dnsmasq lease file
+        try:
+            with open(self.dnsmasq_lease_path, 'r') as f:
+                for line in f:
+                    parts = line.strip().split()
+                    # Format: expiry_timestamp mac_address lease_ip_address hostname client_id
+                    if len(parts) >= 3 and parts[2] == validated_ip:
+                        mac = parts[1].lower()
+                        # Validate MAC format from lease file just in case
+                        return self.validator.validate(mac, 'mac_address', context="captive_portal_get_mac_lease_parse")
+        except FileNotFoundError:
+            logging.warning(f"dnsmasq lease file not found at {self.dnsmasq_lease_path}. Falling back to ARP.")
+        except ValidationError as ve: # From validating MAC from lease file
+            logging.warning(f"Invalid MAC format found in lease file for IP {validated_ip}: {ve}. Falling back to ARP.")
+        except Exception as e:
+            logging.error(f"Error reading or parsing dnsmasq lease file {self.dnsmasq_lease_path}: {e}. Falling back to ARP.")
+
+        # Priority 2 (Fallback): ARP Table
         try:
             import subprocess
             # Use validated_ip in the command
+            # Added check=False to prevent CalledProcessError from stopping execution if arp command fails for some reason
             result = subprocess.run(['arp', '-n', validated_ip],
-                                  capture_output=True, text=True)
+                                  capture_output=True, text=True, check=False)
             if result.returncode == 0:
                 lines = result.stdout.strip().split('\n')
                 for line in lines:
-                    if ip_address in line:
+                    # Ensure we are looking for the validated_ip to avoid issues if original ip_address was different
+                    if validated_ip in line:
                         parts = line.split()
                         if len(parts) >= 3:
-                            return parts[2]  # MAC address
-        except Exception as e:
-            logging.error(f"Error getting MAC address for {ip_address}: {e}")
+                            mac_from_arp = parts[2].lower()
+                            if mac_from_arp != "incomplete" and "<incomplete>" not in mac_from_arp : # Check for incomplete arp entries
+                                return self.validator.validate(mac_from_arp, 'mac_address', context="captive_portal_get_mac_arp_parse")
+            else:
+                logging.warning(f"arp command failed for IP {validated_ip}. stderr: {result.stderr}")
+
+        except FileNotFoundError:
+            logging.error("'arp' command not found. Cannot determine MAC address using ARP.")
+        except ValidationError as ve_arp: # From validating MAC from ARP
+             logging.warning(f"Invalid MAC format found in ARP output for IP {validated_ip}: {ve_arp}.")
+        except Exception as e: # Catch other subprocess or general errors
+            logging.error(f"Error getting MAC address for {validated_ip} using ARP: {e}")
         
-        return f"unknown_{ip_address.replace('.', '_')}"
+        logging.warning(f"Could not determine MAC for IP {validated_ip} from lease or ARP.")
+        return f"unknown_mac_for_{validated_ip.replace('.', '_')}"
     
     def is_authenticated(self, mac_address):
         """Check if device is authenticated"""
@@ -344,17 +394,48 @@ class CaptivePortal:
         if self.running:
             return False
         
+        # Fetch captive portal specific configuration
+        # Assuming system_config is loaded in config_manager instance.
+        # A more robust way might be to pass specific cp_config to CaptivePortal or have methods in config_manager.
+
+        # Try to get 'captive_portal' dict from main_config first, then system_config as fallback
+        main_cfg = self.config_manager.get_config()
+        system_cfg = self.config_manager.load_system_config() # Ensure system_cfg is loaded if not already part of self.config_manager.system_config
+
+        cp_config_main = main_cfg.get('captive_portal', {})
+        cp_config_system = system_cfg.get('captive_portal', {})
+
+        # Prioritize system_config for listen_host and port if available, else main_config, else defaults
+        listen_host_main = cp_config_main.get('listen_host')
+        listen_port_main = cp_config_main.get('port')
+
+        listen_host_system = cp_config_system.get('listen_host')
+        listen_port_system = cp_config_system.get('port')
+
+        # Determine final host and port
+        # If system_config has it, use it. Else if main_config has it, use it. Else use method param default.
+        final_listen_host = listen_host_system if listen_host_system is not None else (listen_host_main if listen_host_main is not None else host)
+        final_listen_port = listen_port_system if listen_port_system is not None else (listen_port_main if listen_port_main is not None else port)
+
+        # Validate the determined host and port
         try:
-            self.server = make_server(host, port, self.app, threaded=True)
+            validated_host = self.validator.validate(final_listen_host, 'ip_address', context="captive_portal_listen_host")
+            validated_port = self.validator.validate(str(final_listen_port), 'port', context="captive_portal_listen_port")
+        except ValidationError as e:
+            logging.error(f"Invalid host/port for captive portal: Host='{final_listen_host}', Port='{final_listen_port}'. Error: {e}")
+            return False
+
+        try:
+            self.server = make_server(validated_host, validated_port, self.app, threaded=True)
             self.server_thread = threading.Thread(target=self.server.serve_forever)
             self.server_thread.daemon = True
             self.server_thread.start()
             self.running = True
             
-            logging.info(f"Captive portal started on {host}:{port}")
+            logging.info(f"Captive portal started on {validated_host}:{validated_port}")
             return True
         except Exception as e:
-            logging.error(f"Failed to start captive portal: {e}")
+            logging.error(f"Failed to start captive portal on {validated_host}:{validated_port}: {e}")
             return False
     
     def stop_portal(self):

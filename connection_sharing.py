@@ -61,34 +61,18 @@ class ConnectionSharingManager:
             self.logger.error(f"Invalid interface name for Linux sharing. Error: {e}")
             return False
 
+        # This method now ONLY handles IP forwarding.
+        # iptables rules are managed by FirewallManager.
         try:
-            commands = [
-                # Enable IP forwarding
-                ['sysctl', 'net.ipv4.ip_forward=1'], # Static part, arg is safe
-                
-                # Clear existing rules (static commands)
-                ['iptables', '-t', 'nat', '-F', 'POSTROUTING'],
-                ['iptables', '-F', 'FORWARD'],
-                
-                # Setup NAT
-                ['iptables', '-t', 'nat', '-A', 'POSTROUTING', 
-                 '-o', validated_primary_iface, '-j', 'MASQUERADE'],
-                
-                # Allow forwarding
-                ['iptables', '-A', 'FORWARD', '-i', validated_hotspot_iface,
-                 '-o', validated_primary_iface, '-j', 'ACCEPT'],
-                ['iptables', '-A', 'FORWARD', '-i', validated_primary_iface,
-                 '-o', validated_hotspot_iface, '-m', 'state',
-                 '--state', 'RELATED,ESTABLISHED', '-j', 'ACCEPT']
-            ]
+            # Enable IP forwarding
+            # Use _execute_command for consistency if we create one, or keep direct subprocess.run
+            cmd = ['sysctl', 'net.ipv4.ip_forward=1']
+            result = subprocess.run(cmd, capture_output=True, text=True, check=False) # allow failure
+            if result.returncode != 0:
+                self.logger.error(f"Failed to enable IP forwarding: {result.stderr}")
+                return False
             
-            for cmd in commands:
-                result = subprocess.run(cmd, capture_output=True)
-                if result.returncode != 0:
-                    self.logger.error(f"Command failed: {' '.join(cmd)}")
-                    return False
-            
-            self.logger.info("Linux internet sharing configured successfully")
+            self.logger.info("Kernel IP forwarding enabled.")
             return True
             
         except Exception as e:
@@ -123,7 +107,7 @@ class ConnectionSharingManager:
             # Let's focus on validating the inputs to the f-string.
             # The risk is if primary_iface or hotspot_iface contains malicious PowerShell code.
             # The 'interface' rule should prevent typical command injection characters.
-            
+
             powershell_script_block = f'''
             $primaryAdapter = Get-NetAdapter -Name "{validated_primary_iface}"
             If (-Not $primaryAdapter) {{ Write-Error "Primary adapter {validated_primary_iface} not found."; Exit 1 }}
@@ -166,7 +150,7 @@ class ConnectionSharingManager:
                 self.logger.error(f"PowerShell configuration script failed: {ps_result.stderr}")
                 # It might not be a fatal error for the whole operation depending on what failed.
                 # For now, we'll log and continue.
-            
+
             self.logger.info("Windows internet sharing configuration attempted.")
             return True
             
@@ -206,14 +190,14 @@ class ConnectionSharingManager:
         """Disable internet connection sharing"""
         try:
             if self.system == "linux":
-                commands = [
-                    ['iptables', '-t', 'nat', '-F', 'POSTROUTING'],
-                    ['iptables', '-F', 'FORWARD'],
-                    ['sysctl', 'net.ipv4.ip_forward=0']
-                ]
-                
-                for cmd in commands:
-                    subprocess.run(cmd, capture_output=True)
+                # Disable IP forwarding
+                cmd = ['sysctl', 'net.ipv4.ip_forward=0']
+                result = subprocess.run(cmd, capture_output=True, text=True, check=False) # allow failure
+                if result.returncode != 0:
+                    self.logger.warning(f"Failed to disable IP forwarding: {result.stderr}")
+                    # Continue, as this might not be a critical failure for stopping the hotspot
+                else:
+                    self.logger.info("Kernel IP forwarding disabled.")
             
             elif self.system == "windows":
                 # Disable hosted network

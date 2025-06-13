@@ -38,7 +38,15 @@ try:
 
 from input_validator import get_validator, ValidationError
 
-except ImportError:
+# Imports for daemon mode
+import argparse
+from config_manager import ConfigManager
+# HotspotManager class is defined in this file.
+from service_manager import ServiceManager # ServiceConfig might not be needed at this top level
+from production_logger import get_logger
+# Other managers for daemon mode can be imported if/when run_daemon_mode is fleshed out
+
+except ImportError: # This block is for PyQt5, keep it as is
     print("PyQt5 not found. Installing...")
     subprocess.run([sys.executable, "-m", "pip", "install", "PyQt5"], check=True)
     from PyQt5.QtWidgets import * # QMessageBox is here
@@ -529,6 +537,9 @@ class HotspotGUI(QMainWindow):
         # Check dependencies
         self.check_system_requirements()
     
+    # This class attribute will store settings from the SettingsDialog
+    advanced_settings: Dict = {}
+
     def init_ui(self):
         """Initialize the main user interface"""
         self.setWindowTitle("Linux Hotspot Manager")

@@ -69,6 +69,7 @@ class ConfigManager:
             'dhcp_lease_time': '24h', # Added
             'dns_servers': ['8.8.8.8', '8.8.4.4'], # Upstream DNS
             'blocked_domains': [], # Added for domain blocking
+            'dnsmasq_lease_file': '/tmp/hotterspot.leases', # Added default path for lease file
             'dnsmasq_extra_options': [], # For custom dnsmasq directives
             'captive_portal_enabled': False, # To control address=/#/ rule
             'local_domain_name': 'hotspot.local', # Optional local domain
@@ -105,6 +106,7 @@ class ConfigManager:
             'dhcp_lease_time': 'user_input', # e.g. "12h", "1d"
             # dns_servers is a list
             # blocked_domains is a list
+            'dnsmasq_lease_file': 'filename', # Validate as a path/filename
             # dnsmasq_extra_options is a list of strings.
             'captive_portal_enabled': 'user_input', # boolean
             'local_domain_name': 'user_input', # or a 'hostname' like rule if available
