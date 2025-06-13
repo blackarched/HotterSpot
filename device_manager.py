@@ -10,9 +10,11 @@ import os
 import time
 from datetime import datetime
 import platform
+from input_validator import get_validator, ValidationError
 
 class DeviceManager:
     def __init__(self, config_dir='hotspot_config'):
+        self.validator = get_validator()
         self.config_dir = config_dir
         self.blocked_devices_file = os.path.join(config_dir, 'blocked_devices.json')
         self.allowed_devices_file = os.path.join(config_dir, 'allowed_devices.json')
@@ -88,17 +90,27 @@ class DeviceManager:
     def block_device_linux(self, mac_address, ip_address=None):
         """Block device on Linux using iptables"""
         try:
+            validated_mac = self.validator.validate(mac_address, 'mac_address', context="dev_mgr_block_linux_mac")
+            validated_ip = None
+            if ip_address:
+                validated_ip = self.validator.validate(ip_address, 'ip_address', context="dev_mgr_block_linux_ip")
+        except ValidationError as e:
+            print(f"Invalid input for block_device_linux: {e}")
+            return False
+
+        try:
             # Block by MAC address
             cmd = ['sudo', 'iptables', '-A', 'FORWARD', '-m', 'mac', 
-                   '--mac-source', mac_address, '-j', 'DROP']
-            result = subprocess.run(cmd, capture_output=True, text=True)
+                   '--mac-source', validated_mac, '-j', 'DROP']
+            result = subprocess.run(cmd, capture_output=True, text=True, check=False) # check=False to handle non-zero exits gracefully
             
             if result.returncode == 0:
                 # Also block by IP if available
-                if ip_address:
-                    cmd_ip = ['sudo', 'iptables', '-A', 'FORWARD', '-s', ip_address, '-j', 'DROP']
-                    subprocess.run(cmd_ip, capture_output=True, text=True)
+                if validated_ip:
+                    cmd_ip = ['sudo', 'iptables', '-A', 'FORWARD', '-s', validated_ip, '-j', 'DROP']
+                    subprocess.run(cmd_ip, capture_output=True, text=True, check=False)
                 return True
+            print(f"iptables (MAC block) failed for {validated_mac}: {result.stderr}")
             return False
         except Exception as e:
             print(f"Error blocking device on Linux: {e}")
@@ -107,17 +119,27 @@ class DeviceManager:
     def unblock_device_linux(self, mac_address, ip_address=None):
         """Unblock device on Linux using iptables"""
         try:
+            validated_mac = self.validator.validate(mac_address, 'mac_address', context="dev_mgr_unblock_linux_mac")
+            validated_ip = None
+            if ip_address:
+                validated_ip = self.validator.validate(ip_address, 'ip_address', context="dev_mgr_unblock_linux_ip")
+        except ValidationError as e:
+            print(f"Invalid input for unblock_device_linux: {e}")
+            return False
+
+        try:
             # Remove MAC-based block
             cmd = ['sudo', 'iptables', '-D', 'FORWARD', '-m', 'mac', 
-                   '--mac-source', mac_address, '-j', 'DROP']
-            result = subprocess.run(cmd, capture_output=True, text=True)
+                   '--mac-source', validated_mac, '-j', 'DROP']
+            # We don't check=True because the rule might not exist, and that's okay for an unblock operation.
+            subprocess.run(cmd, capture_output=True, text=True)
             
             # Remove IP-based block if available
-            if ip_address:
-                cmd_ip = ['sudo', 'iptables', '-D', 'FORWARD', '-s', ip_address, '-j', 'DROP']
+            if validated_ip:
+                cmd_ip = ['sudo', 'iptables', '-D', 'FORWARD', '-s', validated_ip, '-j', 'DROP']
                 subprocess.run(cmd_ip, capture_output=True, text=True)
             
-            return result.returncode == 0
+            return True # Assume success even if rules didn't exist, as the goal is for them to not be there.
         except Exception as e:
             print(f"Error unblocking device on Linux: {e}")
             return False
@@ -125,14 +147,30 @@ class DeviceManager:
     def block_device_windows(self, mac_address, ip_address=None):
         """Block device on Windows using netsh"""
         try:
+            # For rule name, MAC might need to be stripped of colons/hyphens depending on netsh constraints.
+            # 'filename' rule is restrictive and good for such names.
+            validated_mac_for_name = self.validator.validate(mac_address.replace(":", "").replace("-",""), 'filename', context="dev_mgr_block_win_mac_name")
+            validated_ip = None
             if ip_address:
-                # Block by IP address
-                cmd = ['netsh', 'advfirewall', 'firewall', 'add', 'rule', 
-                       f'name=Block_{mac_address}', 'dir=in', 'action=block', 
-                       f'remoteip={ip_address}']
-                result = subprocess.run(cmd, capture_output=True, text=True)
-                return result.returncode == 0
+                 validated_ip = self.validator.validate(ip_address, 'ip_address', context="dev_mgr_block_win_ip")
+            else: # IP address is required for this windows block method
+                print("IP address required for blocking device on Windows.")
+                return False
+        except ValidationError as e:
+            print(f"Invalid input for block_device_windows: {e}")
             return False
+
+        try:
+            # Block by IP address
+            rule_name = f'Block_{validated_mac_for_name}'
+            cmd = ['netsh', 'advfirewall', 'firewall', 'add', 'rule',
+                   f'name={rule_name}', 'dir=in', 'action=block',
+                   f'remoteip={validated_ip}']
+            result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            if result.returncode != 0:
+                print(f"netsh advfirewall (block) failed for {validated_ip}: {result.stderr}")
+                return False
+            return True
         except Exception as e:
             print(f"Error blocking device on Windows: {e}")
             return False
@@ -140,11 +178,19 @@ class DeviceManager:
     def unblock_device_windows(self, mac_address, ip_address=None):
         """Unblock device on Windows using netsh"""
         try:
+            validated_mac_for_name = self.validator.validate(mac_address.replace(":", "").replace("-",""), 'filename', context="dev_mgr_unblock_win_mac_name")
+        except ValidationError as e:
+            print(f"Invalid MAC format for rule name in unblock_device_windows: {e}")
+            return False
+
+        try:
             # Remove firewall rule
+            rule_name = f'Block_{validated_mac_for_name}'
             cmd = ['netsh', 'advfirewall', 'firewall', 'delete', 'rule', 
-                   f'name=Block_{mac_address}']
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            return result.returncode == 0
+                   f'name={rule_name}']
+            # Not checking result, rule might not exist.
+            subprocess.run(cmd, capture_output=True, text=True, check=False)
+            return True
         except Exception as e:
             print(f"Error unblocking device on Windows: {e}")
             return False
@@ -162,10 +208,19 @@ class DeviceManager:
     def disconnect_device_linux(self, mac_address):
         """Disconnect device from Linux hotspot"""
         try:
+            validated_mac = self.validator.validate(mac_address, 'mac_address', context="dev_mgr_disconnect_linux_mac")
+        except ValidationError as e:
+            print(f"Invalid MAC address for disconnect_device_linux: {e}")
+            return False
+
+        try:
             # Force deauth using hostapd_cli if available
-            cmd = ['sudo', 'hostapd_cli', 'deauthenticate', mac_address]
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            return result.returncode == 0
+            cmd = ['sudo', 'hostapd_cli', 'deauthenticate', validated_mac]
+            result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            if result.returncode != 0:
+                print(f"hostapd_cli deauthenticate failed for {validated_mac}: {result.stderr}")
+                return False
+            return True
         except Exception as e:
             print(f"Error disconnecting device on Linux: {e}")
             return False
@@ -260,21 +315,42 @@ class DeviceManager:
     
     def apply_limits_linux(self, mac_address, upload_limit_kbps, download_limit_kbps):
         """Apply bandwidth limits on Linux using tc"""
+        # Note: mac_address is not directly used in these example tc commands,
+        # but would be if implementing per-client rules with filters.
+        # Validating it anyway for good practice if it were to be used.
         try:
-            interface = 'ap0'  # Default AP interface, may need adjustment
-            
-            if upload_limit_kbps:
-                # Create upload limit
-                cmd = ['sudo', 'tc', 'qdisc', 'add', 'dev', interface, 'root', 'handle', '1:', 'htb']
-                subprocess.run(cmd, capture_output=True)
+            validated_mac = self.validator.validate(mac_address, 'mac_address', context="dev_mgr_apply_limits_mac")
+            # Assuming interface is obtained from a trusted source or hardcoded for now
+            interface_to_use = 'ap0' # Example, should be from config or detection
+            validated_interface = self.validator.validate(interface_to_use, 'interface', context="dev_mgr_apply_limits_interface")
+        except ValidationError as e:
+            print(f"Invalid input for apply_limits_linux: {e}")
+            return False
+
+        try:
+            if upload_limit_kbps is not None: # Ensure it's a valid number if provided
+                if not isinstance(upload_limit_kbps, (int, float)) or upload_limit_kbps <=0:
+                    print(f"Invalid upload_limit_kbps: {upload_limit_kbps}")
+                    return False
                 
-                cmd = ['sudo', 'tc', 'class', 'add', 'dev', interface, 'parent', '1:', 
-                       'classid', '1:1', 'htb', 'rate', f'{upload_limit_kbps}kbit']
-                subprocess.run(cmd, capture_output=True)
+                # Example tc commands (these are basic and might need refinement for a full solution)
+                # These commands are illustrative and may not work perfectly without a proper tc setup.
+                # They also don't implement per-MAC limiting directly without more complex filter setup.
+                cmd_qdisc = ['sudo', 'tc', 'qdisc', 'add', 'dev', validated_interface, 'root', 'handle', '1:', 'htb']
+                subprocess.run(cmd_qdisc, capture_output=True, text=True, check=False) # Best effort
+
+                # Class for the specific MAC (more complex setup needed to link MAC to class)
+                # This classid '1:1' is a generic example, real per-device would need unique classids
+                cmd_class = ['sudo', 'tc', 'class', 'add', 'dev', validated_interface, 'parent', '1:',
+                             'classid', '1:1', 'htb', 'rate', f'{int(upload_limit_kbps)}kbit']
+                subprocess.run(cmd_class, capture_output=True, text=True, check=False)
             
-            return True
+            # Similar logic for download_limit_kbps would go here, often applied on egress of another interface or using IFB.
+
+            print(f"Bandwidth limits (partially) applied for {validated_mac} on {validated_interface} (implementation is basic).")
+            return True # Placeholder, actual success depends on tc commands
         except Exception as e:
-            print(f"Error applying bandwidth limits: {e}")
+            print(f"Error applying bandwidth limits for {validated_mac}: {e}")
             return False
     
     def add_to_whitelist(self, mac_address, device_name=None):

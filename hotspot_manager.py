@@ -10,9 +10,11 @@ import logging
 from typing import Dict, List, Optional, Tuple
 import psutil
 import time
+from input_validator import get_validator, ValidationError
 
 class HotspotManager:
     def __init__(self):
+        self.validator = get_validator()
         self.system = platform.system().lower()
         self.is_active = False
         self.current_ssid = None
@@ -52,14 +54,24 @@ class HotspotManager:
     
     def create_hotspot(self, ssid: str, password: str, interface: str = None) -> bool:
         """Create and start hotspot"""
-        if len(password) < 8:
-            self.logger.error("Password must be at least 8 characters")
+        try:
+            # Basic validation, more thorough validation should happen before calling this.
+            # The input_validator's 'password' rule already checks length.
+            # Here, we ensure that the validator is used for all inputs before they reach subprocess.
+            validated_ssid = self.validator.validate(ssid, 'ssid', context="hotspot_mgr_create_ssid")
+            validated_password = self.validator.validate(password, 'password', context="hotspot_mgr_create_password")
+            validated_interface = None
+            if interface:
+                validated_interface = self.validator.validate(interface, 'interface', context="hotspot_mgr_create_interface")
+        except ValidationError as e:
+            self.logger.error(f"Hotspot configuration validation failed: {e}")
             return False
             
         if self.system == "linux":
-            return self._create_linux_hotspot(ssid, password, interface)
+            return self._create_linux_hotspot(validated_ssid, validated_password, validated_interface)
         elif self.system == "windows":
-            return self._create_windows_hotspot(ssid, password)
+            # Windows hotspot creation does not typically use an interface argument in the same way with netsh for hostednetwork
+            return self._create_windows_hotspot(validated_ssid, validated_password)
         else:
             self.logger.error(f"Unsupported system: {self.system}")
             return False
@@ -67,33 +79,43 @@ class HotspotManager:
     def _create_linux_hotspot(self, ssid: str, password: str, interface: str = None) -> bool:
         """Create hotspot on Linux using nmcli"""
         try:
-            if not interface:
-                interfaces = self.get_available_interfaces()
-                if not interfaces:
-                    self.logger.error("No available wireless interfaces")
+            # Interface validation is done in the calling public method create_hotspot
+            # If interface is None here, it means it should be auto-detected or use a default.
+            current_interface = interface
+            if not current_interface:
+                available_interfaces = self.get_available_interfaces() # This itself uses subprocess but seems safe (static command)
+                if not available_interfaces:
+                    self.logger.error("No available wireless interfaces for Linux hotspot.")
                     return False
-                interface = interfaces[0]
+                current_interface = available_interfaces[0] # Use the first available one
             
-            self.interface = interface
+            # Re-validate if it was auto-selected, though get_available_interfaces should give valid ones.
+            try:
+                validated_interface_final = self.validator.validate(current_interface, 'interface', context="hotspot_mgr_linux_final_interface")
+            except ValidationError as e:
+                self.logger.error(f"Auto-selected interface {current_interface} is invalid: {e}")
+                return False
+
+            self.interface = validated_interface_final
             
-            # Stop any existing hotspot
+            # Stop any existing hotspot (uses static name "HotspotTool", generally safe)
             self.stop_hotspot()
             
-            # Create hotspot connection
+            # Create hotspot connection using validated inputs
             cmd = [
                 "nmcli", "device", "wifi", "hotspot",
-                "ifname", interface,
-                "con-name", "HotspotTool",
-                "ssid", ssid,
-                "password", password
+                "ifname", self.interface, # Use validated interface stored in self.interface
+                "con-name", "HotspotTool", # Static name
+                "ssid", ssid, # Already validated ssid
+                "password", password # Already validated password
             ]
             
-            result = subprocess.run(cmd, capture_output=True, text=True)
+            result = subprocess.run(cmd, capture_output=True, text=True, check=False)
             
             if result.returncode == 0:
                 self.is_active = True
-                self.current_ssid = ssid
-                self.current_password = password
+                self.current_ssid = ssid # Store original (or validated, they should be same format)
+                self.current_password = password # Store original
                 self.logger.info(f"Hotspot '{ssid}' created successfully")
                 return True
             else:
@@ -110,23 +132,35 @@ class HotspotManager:
             # Stop any existing hotspot
             self.stop_hotspot()
             
-            # Set up hosted network
-            setup_cmd = [
+            # Set up hosted network using validated inputs
+            # ssid and password are pre-validated by the public create_hotspot method
+            # The main risk here is if ssid or password contained characters that netsh interprets specially,
+            # even if they pass basic 'ssid' and 'password' validation.
+            # However, 'ssid' and 'password' rules should strip/forbid most dangerous chars.
+            # For f-strings, the primary defense is ensuring the interpolated variables are clean.
+
+            # It's safer to pass arguments individually if the tool supports it,
+            # but netsh set hostednetwork often uses key=value pairs in one string.
+            # We rely on the validator to have cleaned ssid and password sufficiently.
+
+            setup_cmd_args = [
                 "netsh", "wlan", "set", "hostednetwork",
-                "mode=allow", f"ssid={ssid}", f"key={password}"
+                "mode=allow",
+                f"ssid={ssid}", # ssid is validated
+                f"key={password}"  # password is validated
             ]
             
-            result = subprocess.run(setup_cmd, capture_output=True, text=True)
+            result_setup = subprocess.run(setup_cmd_args, capture_output=True, text=True, check=False)
             
-            if result.returncode != 0:
-                self.logger.error(f"Failed to setup hosted network: {result.stderr}")
+            if result_setup.returncode != 0:
+                self.logger.error(f"Failed to setup hosted network: {result_setup.stderr}")
                 return False
             
-            # Start hosted network
-            start_cmd = ["netsh", "wlan", "start", "hostednetwork"]
-            result = subprocess.run(start_cmd, capture_output=True, text=True)
+            # Start hosted network (static command)
+            start_cmd_args = ["netsh", "wlan", "start", "hostednetwork"]
+            result_start = subprocess.run(start_cmd_args, capture_output=True, text=True, check=False)
             
-            if result.returncode == 0:
+            if result_start.returncode == 0:
                 self.is_active = True
                 self.current_ssid = ssid
                 self.current_password = password

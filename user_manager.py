@@ -12,9 +12,11 @@ import time
 from typing import Dict, List, Optional
 from datetime import datetime, timedelta
 import threading
+from input_validator import get_validator, ValidationError
 
 class UserManager:
     def __init__(self, db_path: str = "users.db"):
+        self.validator = get_validator()
         self.system = platform.system().lower()
         self.logger = logging.getLogger(__name__)
         self.db_path = db_path
@@ -211,27 +213,47 @@ class UserManager:
     
     def _block_device_linux(self, mac_address: str):
         """Block device on Linux using iptables"""
+        # This is an internal method; mac_address should be validated by public calling methods.
+        # However, adding validation here for defense in depth.
+        try:
+            validated_mac = self.validator.validate(mac_address, 'mac_address', context="user_mgr_block_linux_mac")
+        except ValidationError as e:
+            self.logger.error(f"Invalid MAC address for _block_device_linux: {mac_address}. Error: {e}")
+            return
+
         try:
             # Block by MAC address
             subprocess.run([
                 "iptables", "-I", "FORWARD", "-m", "mac", 
-                "--mac-source", mac_address, "-j", "DROP"
-            ], check=True)
+                "--mac-source", validated_mac, "-j", "DROP"
+            ], check=True) # check=True will raise CalledProcessError on failure
             
         except subprocess.CalledProcessError as e:
-            self.logger.error(f"Failed to block device with iptables: {e}")
+            self.logger.error(f"Failed to block device {validated_mac} with iptables: {e.stderr}")
+        except FileNotFoundError:
+            self.logger.error(f"iptables command not found when trying to block {validated_mac}.")
     
     def _unblock_device_linux(self, mac_address: str):
         """Unblock device on Linux using iptables"""
         try:
+            validated_mac = self.validator.validate(mac_address, 'mac_address', context="user_mgr_unblock_linux_mac")
+        except ValidationError as e:
+            self.logger.error(f"Invalid MAC address for _unblock_device_linux: {mac_address}. Error: {e}")
+            return
+
+        try:
             # Remove block rule
+            # Using check=False as the rule might not exist, and that's fine for an unblock operation.
             subprocess.run([
                 "iptables", "-D", "FORWARD", "-m", "mac", 
-                "--mac-source", mac_address, "-j", "DROP"
-            ], check=True)
+                "--mac-source", validated_mac, "-j", "DROP"
+            ], check=False, capture_output=True, text=True)
             
-        except subprocess.CalledProcessError as e:
-            self.logger.error(f"Failed to unblock device with iptables: {e}")
+        except FileNotFoundError:
+             self.logger.error(f"iptables command not found when trying to unblock {validated_mac}.")
+        except Exception as e: # Catch any other potential errors
+            self.logger.error(f"An unexpected error occurred while trying to unblock {validated_mac}: {e}")
+
     
     def _block_device_windows(self, mac_address: str):
         """Block device on Windows (limited functionality)"""

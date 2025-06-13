@@ -14,9 +14,11 @@ from datetime import datetime
 from flask import Flask, render_template_string, request, redirect, session, jsonify
 from werkzeug.serving import make_server
 import logging
+from input_validator import get_validator, ValidationError
 
 class CaptivePortal:
     def __init__(self, config_manager, user_manager):
+        self.validator = get_validator()
         self.config_manager = config_manager
         self.user_manager = user_manager
         self.app = Flask(__name__)
@@ -104,9 +106,19 @@ class CaptivePortal:
     
     def get_mac_from_ip(self, ip_address):
         """Get MAC address from IP address using ARP table"""
+        if not ip_address: # Basic check
+            return f"unknown_invalid_ip"
+
+        try:
+            validated_ip = self.validator.validate(ip_address, 'ip_address', context="captive_portal_get_mac_ip")
+        except ValidationError as e:
+            logging.error(f"Invalid IP address received for MAC lookup: {ip_address}. Error: {e}")
+            return f"unknown_invalid_ip_{ip_address.replace('.', '_')}"
+
         try:
             import subprocess
-            result = subprocess.run(['arp', '-n', ip_address], 
+            # Use validated_ip in the command
+            result = subprocess.run(['arp', '-n', validated_ip],
                                   capture_output=True, text=True)
             if result.returncode == 0:
                 lines = result.stdout.strip().split('\n')

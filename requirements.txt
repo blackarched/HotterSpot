@@ -1,0 +1,7 @@
+# This file lists Python dependencies.
+# System-level dependencies (e.g., hostapd, dnsmasq, nmcli, iptables)
+# are expected to be handled by the setup_script.sh.
+Flask
+psutil
+PyQt5
+netifaces

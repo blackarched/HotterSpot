@@ -159,80 +159,197 @@ install_dependencies() {
 
 # Install Python dependencies
 install_python_deps() {
-    log "Installing Python dependencies..."
-    
-    # Try to install using pip if system packages are not available
-    pip3 install --break-system-packages 2>/dev/null || pip3 install \
-        PyQt5 \
-        psutil \
-        netifaces \
-        configparser
-    
-    success "Python dependencies installed"
+    log "Checking for python3-venv package..."
+    case $DISTRO in
+        "ubuntu"|"debian"|"linuxmint"|"pop"|"elementary")
+            if ! dpkg -s python3-venv >/dev/null 2>&1; then
+                log "python3-venv not found, installing..."
+                apt install -y python3-venv
+            fi
+            ;;
+        "fedora"|"centos"|"rhel"|"rocky"|"almalinux")
+            if ! rpm -q python3-venv >/dev/null 2>&1; then # This check might vary
+                log "python3-venv not found, installing..."
+                if command -v dnf &> /dev/null; then
+                    dnf install -y python3-venv # Or python3-virtualenv, package name can vary
+                else
+                    yum install -y python3-venv # Or python3-virtualenv
+                fi
+            fi
+            ;;
+        "arch"|"manjaro"|"endeavouros")
+            if ! pacman -Q python-virtualenv >/dev/null 2>&1; then # Arch uses python-virtualenv
+                log "python-virtualenv not found, installing..."
+                pacman -S --noconfirm python-virtualenv
+            fi
+            ;;
+        "opensuse"|"opensuse-leap"|"opensuse-tumbleweed")
+             if ! rpm -q python3-virtualenv >/dev/null 2>&1; then # openSUSE might use python3-virtualenv
+                log "python3-virtualenv not found, installing..."
+                zypper install -y python3-virtualenv
+            fi
+            ;;
+        *)
+            warn "Could not automatically check/install venv package for $DISTRO. Please ensure python3 venv capabilities are available."
+            ;;
+    esac
+
+    log "Creating Python virtual environment in $INSTALL_DIR/venv..."
+    python3 -m venv "$INSTALL_DIR/venv"
+    if [ ! -f "$INSTALL_DIR/venv/bin/python3" ]; then
+        error "Failed to create Python virtual environment."
+        error "Please ensure python3 and the appropriate venv package (e.g., python3-venv) are installed correctly."
+        exit 1
+    fi
+
+    log "Installing Python dependencies from requirements.txt into virtual environment..."
+    if [ ! -f "$SCRIPT_DIR/requirements.txt" ]; then
+        error "requirements.txt not found in $SCRIPT_DIR!"
+        exit 1
+    fi
+
+    "$INSTALL_DIR/venv/bin/pip3" install -r "$SCRIPT_DIR/requirements.txt"
+    if [ $? -ne 0 ]; then
+        error "Failed to install Python dependencies from requirements.txt."
+        # Optionally, you could add a fallback here to install packages individually if -r fails
+        # For now, we'll keep it strict.
+        exit 1
+    fi
+    success "Python dependencies installed into virtual environment."
 }
 
 # Create installation directory
 setup_installation() {
-    log "Setting up installation directory..."
+    log "Setting up installation directory: $INSTALL_DIR"
+    mkdir -p "$INSTALL_DIR/lib"
+    # No separate bin directory for now, main script will be in $INSTALL_DIR
+    # mkdir -p "$INSTALL_DIR/bin"
+
+    # Copy all python files
+    log "Copying Python application files..."
+    if ls "$SCRIPT_DIR"/*.py > /dev/null 2>&1; then
+        for py_file in "$SCRIPT_DIR"/*.py; do
+            base_name=$(basename "$py_file")
+            # Check if the file is not the setup script itself or the uninstall script
+            if [ "$base_name" == "linux_hotspot_main.py" ]; then
+                cp "$py_file" "$INSTALL_DIR/$base_name"
+                chmod +x "$INSTALL_DIR/$base_name"
+                log "Copied and made executable: $INSTALL_DIR/$base_name"
+            elif [ "$base_name" != "setup_script.py" ] && [ "$base_name" != "$(basename "${BASH_SOURCE[0]}")" ] && [ "$base_name" != "uninstall_script.py" ]; then
+                cp "$py_file" "$INSTALL_DIR/lib/"
+                log "Copied to lib: $INSTALL_DIR/lib/$base_name"
+            fi
+        done
+    else
+        warn "No Python files (*.py) found in $SCRIPT_DIR to copy."
+    fi
     
-    # Create installation directory
-    mkdir -p "$INSTALL_DIR"
+    # Copy uninstall script
+    if [ -f "$SCRIPT_DIR/uninstall_script.sh" ]; then # Assuming it's uninstall_script.sh
+        cp "$SCRIPT_DIR/uninstall_script.sh" "$INSTALL_DIR/"
+        chmod +x "$INSTALL_DIR/uninstall_script.sh"
+        log "Copied uninstall script."
+    else
+        warn "Uninstall script (uninstall_script.sh) not found in $SCRIPT_DIR."
+    fi
+
+    log "Creating symlink for main application..."
+    # Symlink directly to the script in $INSTALL_DIR, which will be run via venv python
+    ln -sf "$INSTALL_DIR/linux_hotspot_main.py" "$BIN_LINK"
     
-    # Copy files
-    cp "$SCRIPT_DIR/hotspot_manager.py" "$INSTALL_DIR/"
-    cp "$SCRIPT_DIR/uninstall.sh" "$INSTALL_DIR/" 2>/dev/null || true
-    
-    # Make executable
-    chmod +x "$INSTALL_DIR/hotspot_manager.py"
-    
-    # Create symlink
-    ln -sf "$INSTALL_DIR/hotspot_manager.py" "$BIN_LINK"
-    
-    success "Installation directory created"
+    success "Application files installed and structured."
 }
 
 # Create desktop entry
 create_desktop_entry() {
     log "Creating desktop entry..."
     
+    # Ensure $INSTALL_DIR/venv/bin/python3 is the interpreter
+    PYTHON_EXEC="$INSTALL_DIR/venv/bin/python3"
+    MAIN_SCRIPT_EXEC="$INSTALL_DIR/linux_hotspot_main.py" # Main script is now in $INSTALL_DIR
+
+    # Check if pkexec is available
+    if ! command -v pkexec &> /dev/null; then
+        warn "pkexec not found. Desktop entry will run the script directly, which might require manual password input or run without root privileges if not handled by the script."
+        EXEC_CMD="$PYTHON_EXEC $MAIN_SCRIPT_EXEC"
+    else
+        EXEC_CMD="pkexec $PYTHON_EXEC $MAIN_SCRIPT_EXEC"
+    fi
+
     cat > "$DESKTOP_FILE" << EOF
 [Desktop Entry]
-Name=Hotspot Manager
-Comment=Linux WiFi Hotspot Manager
-Exec=pkexec $INSTALL_DIR/hotspot_manager.py
-Icon=network-wireless
+Name=HotterSpot
+Comment=Linux WiFi Hotspot Management Tool
+Exec=$EXEC_CMD
+Icon=network-wireless-hotspot # A more specific generic icon, or use 'network-wireless'
 Terminal=false
 Type=Application
 Categories=Network;System;
-Keywords=hotspot;wifi;network;sharing;
+Keywords=hotspot;wifi;network;sharing;internet;
 StartupNotify=true
+X-Desktop-File-Install-Version=0.26 # Optional: for versioning the .desktop file itself
 EOF
     
-    success "Desktop entry created"
+    # Validate desktop file
+    if command -v desktop-file-validate &> /dev/null; then
+        desktop-file-validate "$DESKTOP_FILE" || warn "Desktop file validation failed. There might be an issue with the generated .desktop file."
+    else
+        warn "desktop-file-validate command not found. Skipping desktop file validation."
+    fi
+
+    success "Desktop entry created at $DESKTOP_FILE"
 }
 
 # Setup systemd service (optional)
 setup_systemd_service() {
     log "Setting up systemd service..."
     
-    cat > /etc/systemd/system/hotspot-manager.service << EOF
+    SERVICE_FILE="/etc/systemd/system/hotspot-manager.service"
+    # Use the python from the virtual environment
+    PYTHON_EXEC="$INSTALL_DIR/venv/bin/python3"
+    MAIN_SCRIPT="$INSTALL_DIR/linux_hotspot_main.py"
+
+    cat > "$SERVICE_FILE" << EOF
 [Unit]
-Description=Hotspot Manager Service
+Description=HotterSpot Service
 After=network.target
 
 [Service]
 Type=simple
-ExecStart=$INSTALL_DIR/hotspot_manager.py --daemon
+# Ensure linux_hotspot_main.py handles daemonization correctly or change Type to forking
+ExecStart=$PYTHON_EXEC $MAIN_SCRIPT --daemon
+WorkingDirectory=$INSTALL_DIR
+User=root # Consider if a non-root user could be used with appropriate capabilities
+Group=root # Or a dedicated group
 Restart=on-failure
-User=root
+RestartSec=5
+StartLimitIntervalSec=0 # Or a reasonable interval like 60s with StartLimitBurst=5
+
+# StandardOutput=journal # Or append to a log file
+# StandardError=journal  # Or append to a log file
+
+# Security hardening (optional, but recommended)
+# PrivateTmp=true
+# ProtectSystem=full
+# NoNewPrivileges=true
+# PrivateDevices=true
+# ProtectHome=true
+# ProtectKernelTunables=true
+# ProtectKernelModules=true
+# ProtectControlGroups=true
+# RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# SystemCallFilter=@system-service
+# SystemCallArchitectures=native
+# ReadWritePaths=/var/log/hotspot-manager /etc/hotspot-manager # Add paths the app needs to write to
 
 [Install]
 WantedBy=multi-user.target
 EOF
     
     systemctl daemon-reload
-    
-    success "Systemd service created (not enabled by default)"
+    log "Systemd service file created at $SERVICE_FILE"
+    log "To enable and start: sudo systemctl enable --now hotspot-manager.service"
+    success "Systemd service setup complete."
 }
 
 # Configure NetworkManager
@@ -260,199 +377,232 @@ EOF
     success "NetworkManager configured"
 }
 
-# Setup firewall rules
-setup_firewall() {
-    log "Setting up firewall rules..."
-    
-    # Create iptables rules script
-    cat > "$INSTALL_DIR/firewall-rules.sh" << 'EOF'
-#!/bin/bash
+# (No setup_firewall function body anymore, it has been removed)
 
-# Hotspot Manager Firewall Rules
-
-HOTSPOT_INTERFACE="wlan0"  # Default, will be updated by application
-INTERNET_INTERFACE="eth0"   # Default, will be updated by application
-
-setup_rules() {
-    # Enable IP forwarding
-    echo 1 > /proc/sys/net/ipv4/ip_forward
-    
-    # NAT rules
-    iptables -t nat -A POSTROUTING -o $INTERNET_INTERFACE -j MASQUERADE
-    iptables -A FORWARD -i $INTERNET_INTERFACE -o $HOTSPOT_INTERFACE -m state --state RELATED,ESTABLISHED -j ACCEPT
-    iptables -A FORWARD -i $HOTSPOT_INTERFACE -o $INTERNET_INTERFACE -j ACCEPT
-    
-    # DNS redirection (for captive portal)
-    iptables -t nat -A PREROUTING -i $HOTSPOT_INTERFACE -p udp --dport 53 -j REDIRECT --to-port 53
-    iptables -t nat -A PREROUTING -i $HOTSPOT_INTERFACE -p tcp --dport 53 -j REDIRECT --to-port 53
-}
-
-cleanup_rules() {
-    # Remove NAT rules
-    iptables -t nat -D POSTROUTING -o $INTERNET_INTERFACE -j MASQUERADE 2>/dev/null || true
-    iptables -D FORWARD -i $INTERNET_INTERFACE -o $HOTSPOT_INTERFACE -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
-    iptables -D FORWARD -i $HOTSPOT_INTERFACE -o $INTERNET_INTERFACE -j ACCEPT 2>/dev/null || true
-    
-    # Remove DNS redirection
-    iptables -t nat -D PREROUTING -i $HOTSPOT_INTERFACE -p udp --dport 53 -j REDIRECT --to-port 53 2>/dev/null || true
-    iptables -t nat -D PREROUTING -i $HOTSPOT_INTERFACE -p tcp --dport 53 -j REDIRECT --to-port 53 2>/dev/null || true
-}
-
-case "$1" in
-    setup)
-        setup_rules
-        ;;
-    cleanup)
-        cleanup_rules
-        ;;
-    *)
-        echo "Usage: $0 {setup|cleanup}"
-        exit 1
-        ;;
-esac
-EOF
-    
-    chmod +x "$INSTALL_DIR/firewall-rules.sh"
-    
-    success "Firewall rules script created"
-}
-
-# Create configuration directory
+# Create configuration directory and copy default JSON configs
 setup_config() {
-    log "Setting up configuration..."
+    log "Setting up configuration directory..."
     
-    mkdir -p /etc/hotspot-manager
-    
-    cat > /etc/hotspot-manager/config.conf << EOF
-[general]
-default_ssid=HotspotManager
-default_interface=wlan0
-log_level=INFO
-log_file=/var/log/hotspot-manager.log
+    CONFIG_DIR_MAIN="/etc/hotspot-manager"
+    CONFIG_DIR_JSON="$CONFIG_DIR_MAIN/hotspot_config"
 
-[security]
-min_password_length=8
-default_encryption=WPA2
-allow_wps=false
+    mkdir -p "$CONFIG_DIR_JSON"
+    if [ $? -ne 0 ]; then
+        error "Failed to create configuration directory: $CONFIG_DIR_JSON"
+        exit 1
+    fi
+    chmod 755 "$CONFIG_DIR_MAIN"
+    chmod 755 "$CONFIG_DIR_JSON" # Or more restrictive if needed, e.g., 750 if group-managed
 
-[network]
-default_channel=6
-default_ip_range=192.168.4.0/24
-default_gateway=192.168.4.1
-dhcp_range_start=192.168.4.10
-dhcp_range_end=192.168.4.50
+    # Remove old config.conf if it exists
+    if [ -f "$CONFIG_DIR_MAIN/config.conf" ]; then
+        log "Removing old config.conf file..."
+        rm -f "$CONFIG_DIR_MAIN/config.conf"
+    fi
 
-[advanced]
-max_clients=50
-beacon_interval=100
-dtim_period=2
-rts_threshold=2347
-fragm_threshold=2346
-EOF
-    
-    success "Configuration files created"
+    # Placeholder for copying default JSON configuration files
+    # For example, if you have 'default_hotspot_settings.json' in SCRIPT_DIR:
+    # if [ -f "$SCRIPT_DIR/default_hotspot_settings.json" ]; then
+    #    log "Copying default_hotspot_settings.json to $CONFIG_DIR_JSON/"
+    #    cp "$SCRIPT_DIR/default_hotspot_settings.json" "$CONFIG_DIR_JSON/"
+    #    chmod 644 "$CONFIG_DIR_JSON/default_hotspot_settings.json"
+    # else
+    #    warn "No default_hotspot_settings.json found in $SCRIPT_DIR. Application will create one on first run."
+    # fi
+    # Repeat for other default JSON configs if any.
+
+    success "Configuration directory setup at $CONFIG_DIR_JSON"
 }
 
 # Create log rotation
 setup_logging() {
     log "Setting up logging..."
     
+    LOG_DIR_APP="/var/log/hotspot-manager"
+    LOG_FILE_APP="$LOG_DIR_APP/hotspot-manager.log" # Changed from /var/log/hotspot-manager.log
+
+    mkdir -p "$LOG_DIR_APP"
+    if [ $? -ne 0 ]; then
+        error "Failed to create log directory: $LOG_DIR_APP"
+        # Continue, as logging to /tmp might still work or user can fix permissions
+    else
+        # Set permissions for the log directory.
+        # If service runs as root, 755 is fine. If as a specific user, adjust.
+        chmod 755 "$LOG_DIR_APP"
+        log "Log directory $LOG_DIR_APP created."
+    fi
+
+    # Update logrotate config to use the new path
     cat > /etc/logrotate.d/hotspot-manager << EOF
-/var/log/hotspot-manager.log {
+$LOG_FILE_APP {
     daily
     missingok
     rotate 7
     compress
     delaycompress
     notifempty
-    postrotate
-        systemctl reload hotspot-manager 2>/dev/null || true
-    endscript
+    # If the service needs to be reloaded/restarted, use postrotate.
+    # Example:
+    # postrotate
+    #    systemctl reload hotspot-manager.service > /dev/null 2>/dev/null || true
+    # endscript
 }
 EOF
     
-    touch /var/log/hotspot-manager.log
-    chmod 644 /var/log/hotspot-manager.log
-    
-    success "Logging configured"
+    # Touch the log file to ensure it exists with potentially correct ownership if script is run as non-root initially.
+    # However, the service itself should create it with its running user's permissions.
+    touch "$LOG_FILE_APP"
+    # Permissions will be managed by the application/service, or logrotate.
+    # chmod 640 "$LOG_FILE_APP"
+    # chown root:adm "$LOG_FILE_APP" # Or appropriate user/group
+
+    success "Logging configured. Main log file: $LOG_FILE_APP"
 }
 
 # Verify installation
 verify_installation() {
     log "Verifying installation..."
     
-    # Check if files exist
-    if [[ ! -f "$INSTALL_DIR/hotspot_manager.py" ]]; then
-        error "Main application file not found"
-        return 1
+    local all_ok=true
+
+    # Check for main application script
+    if [[ ! -f "$INSTALL_DIR/linux_hotspot_main.py" ]]; then
+        error "Main application file ($INSTALL_DIR/linux_hotspot_main.py) not found."
+        all_ok=false
+    fi
+
+    # Check for lib directory
+    if [[ ! -d "$INSTALL_DIR/lib" ]]; then
+        error "Library directory ($INSTALL_DIR/lib) not found."
+        all_ok=false
     fi
     
+    # Check for venv directory and python executable
+    if [[ ! -f "$INSTALL_DIR/venv/bin/python3" ]]; then
+        error "Python virtual environment interpreter ($INSTALL_DIR/venv/bin/python3) not found."
+        all_ok=false
+    fi
+
     if [[ ! -f "$DESKTOP_FILE" ]]; then
-        error "Desktop file not found"
-        return 1
+        error "Desktop file ($DESKTOP_FILE) not found."
+        all_ok=false
     fi
     
-    if [[ ! -L "$BIN_LINK" ]]; then
-        error "Binary symlink not found"
-        return 1
+    if [[ ! -L "$BIN_LINK" ]] || [[ "$(readlink -f "$BIN_LINK")" != "$INSTALL_DIR/linux_hotspot_main.py" ]]; then
+        error "Binary symlink ($BIN_LINK) not found or not pointing to $INSTALL_DIR/linux_hotspot_main.py."
+        all_ok=false
     fi
-    
-    # Test Python imports
-    python3 -c "
+
+    # Test Python imports within the virtual environment
+    log "Verifying Python dependencies within virtual environment..."
+    if [ -f "$INSTALL_DIR/venv/bin/python3" ]; then
+        "$INSTALL_DIR/venv/bin/python3" -c "
 import sys
 try:
-    from PyQt5.QtWidgets import QApplication
+    import PyQt5.QtWidgets
     import psutil
     import netifaces
-    print('Python dependencies OK')
+    import Flask # Added Flask as per requirements.txt
+    print('Python dependencies seem OK within the virtual environment.')
 except ImportError as e:
-    print(f'Python dependency error: {e}')
+    print(f'ERROR: Python dependency import error within virtual environment: {e}', file=sys.stderr)
     sys.exit(1)
-" || return 1
+"
+        if [ $? -ne 0 ]; then
+            error "Python dependency verification failed within the virtual environment."
+            all_ok=false
+        fi
+    else
+        error "Cannot verify Python dependencies: virtual environment python not found."
+        all_ok=false
+    fi
     
     # Check system tools
     local tools=("nmcli" "hostapd" "dnsmasq" "iptables" "iw")
     for tool in "${tools[@]}"; do
         if ! command -v "$tool" &> /dev/null; then
-            warn "Tool not found: $tool"
+            warn "System tool not found: $tool (This might be an issue for runtime)"
         fi
     done
     
-    success "Installation verified"
+    if [ "$all_ok" = true ]; then
+        success "Installation verified successfully."
+    else
+        error "Installation verification failed. Please check the errors above."
+        # The script will exit due to "set -e" if any command in verify_installation fails and returns non-zero.
+        # If granular control is needed, remove "set -e" and handle exits explicitly.
+        # For now, relying on "set -e" or explicit "exit 1" in called functions.
+        return 1 # Indicate failure
+    fi
 }
 
 # Main installation function
 main() {
-    log "Starting Hotspot Manager installation..."
+    # Ensure SCRIPT_DIR is set if not already
+    # LOG_FILE is defined globally now. Let's update its name.
+    # Clear previous log file
+    LOG_FILE="/tmp/hotterspot-setup.log" # Changed log file name
+    > "$LOG_FILE"
+
+    log "Starting HotterSpot installation..." # Changed name
     
     check_root
     detect_distro
-    install_dependencies
-    install_python_deps
-    setup_installation
-    create_desktop_entry
-    setup_systemd_service
-    configure_networkmanager
-    setup_firewall
-    setup_config
-    setup_logging
-    verify_installation
+
+    # Create $INSTALL_DIR early so venv can be created there
+    log "Creating base installation directory: $INSTALL_DIR"
+    mkdir -p "$INSTALL_DIR"
+    if [ $? -ne 0 ]; then
+        error "Failed to create installation directory: $INSTALL_DIR"
+        exit 1
+    fi
+
+    install_dependencies # Installs system packages
+    install_python_deps  # Creates venv and installs Python packages from requirements.txt
+    setup_installation   # Copies application files, sets up lib structure
+    create_desktop_entry # Creates .desktop file for GUI launch
+    setup_systemd_service # Sets up systemd service
+
+    if command -v systemctl &> /dev/null && systemctl list-units --full -all | grep -q 'NetworkManager.service'; then
+        # Check if NetworkManager is active before trying to configure it
+        if systemctl is-active --quiet NetworkManager; then
+            configure_networkmanager
+        else
+            warn "NetworkManager.service is present but not active. Skipping NetworkManager configuration."
+        fi
+    else
+        warn "NetworkManager.service not detected. Skipping NetworkManager configuration."
+        warn "Manual configuration might be needed if using NetworkManager and it's installed later."
+    fi
+
+    setup_config         # Creates configuration directories
+    setup_logging        # Sets up logging directory and logrotate
+
+    if ! verify_installation; then
+         error "Installation failed due to verification errors. Please check the log: $LOG_FILE"
+         exit 1
+    fi
     
-    success "Installation completed successfully!"
+    success "HotterSpot installation completed successfully!"
     echo
-    echo -e "${GREEN}Hotspot Manager has been installed successfully!${NC}"
+    echo -e "${GREEN}HotterSpot has been installed successfully!${NC}"
     echo
     echo "Usage options:"
-    echo "1. GUI: Search for 'Hotspot Manager' in your applications menu"
-    echo "2. Command line: hotspot-manager"
-    echo "3. Direct: sudo $INSTALL_DIR/hotspot_manager.py"
+    echo "1. GUI: Search for 'HotterSpot' in your applications menu (may require a logout/login or system restart to appear)"
+    echo "2. Command line symlink: hotspot-manager (Note: this symlink points to the script, not the venv python directly)"
+    echo "   To run from command line with venv: sudo $INSTALL_DIR/venv/bin/python3 $INSTALL_DIR/linux_hotspot_main.py"
+    echo "3. Systemd service: sudo systemctl start hotspot-manager.service (after enabling with: sudo systemctl enable hotspot-manager.service)"
     echo
-    echo "Configuration files are located in /etc/hotspot-manager/"
-    echo "Logs are written to /var/log/hotspot-manager.log"
+    echo "Configuration files are located in: $CONFIG_DIR_JSON (Note: variable used from setup_config)"
+    echo "Main application log file is: $LOG_FILE_APP (Note: variable used from setup_logging)"
+    echo "Setup script log is: $LOG_FILE"
     echo
-    echo -e "${YELLOW}Note: The application requires root privileges to manage network interfaces.${NC}"
+    echo -e "${YELLOW}Note: The application typically requires root privileges to manage network interfaces and services.${NC}"
+    echo -e "${YELLOW}The .desktop entry uses 'pkexec' to request these privileges. The systemd service runs as root.${NC}"
     echo
 }
 
-# Run main function
-main "$@"
+# Run main function if the script is executed directly
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi

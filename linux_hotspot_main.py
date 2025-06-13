@@ -33,12 +33,20 @@ try:
         QFont, QIcon, QPixmap, QPainter, QColor, QPalette,
         QLinearGradient, QBrush, QMovie
     )
+# Ensure QMessageBox is available, it's usually part of QtWidgets.*
+# from PyQt5.QtWidgets import QMessageBox (already covered by wildcard import if that's used)
+
+from input_validator import get_validator, ValidationError
+
 except ImportError:
     print("PyQt5 not found. Installing...")
     subprocess.run([sys.executable, "-m", "pip", "install", "PyQt5"], check=True)
-    from PyQt5.QtWidgets import *
+    from PyQt5.QtWidgets import * # QMessageBox is here
     from PyQt5.QtCore import *
     from PyQt5.QtGui import *
+    # Need to re-import for validator if initial try failed
+    from input_validator import get_validator, ValidationError
+
 
 import psutil
 import netifaces
@@ -434,7 +442,54 @@ class SettingsDialog(QDialog):
         layout.addWidget(buttons)
         
         self.setLayout(layout)
-    
+
+    def accept(self):
+        """Validate settings before accepting the dialog."""
+        # Assuming self.parent() gives access to the validator if needed, or pass it in.
+        # For this example, let's assume validator is accessible via self.parent().validator
+        # This is not ideal; validator should ideally be passed to SettingsDialog or be a global singleton.
+        # HotspotGUI instance has self.validator.
+        # Since SettingsDialog is usually created with HotspotGUI as parent:
+        parent_gui = self.parent()
+        if not hasattr(parent_gui, 'validator'):
+            # Fallback if validator is not found, or log an error.
+            # This indicates a structural issue to be resolved for robust validation.
+            print("DEBUG: Validator not found on parent in SettingsDialog. Skipping validation.") # Should not happen with current structure
+            super().accept() # Proceed without validation if validator is missing
+            return
+
+        validator = parent_gui.validator
+
+        channel_text = self.channel_combo.currentText()
+        band = self.band_combo.currentText() # 'bg' or 'a'
+        max_clients_val = self.max_clients_spin.value() # This is already an int
+
+        try:
+            if channel_text != 'Auto':
+                # 'port' rule expects int or string convertible to int, and validates range 1-65535
+                # Channel is 1-14. A custom rule or lambda in validator would be better.
+                # For now, 'port' ensures it's a number. Further logical validation might be needed.
+                validator.validate(channel_text, 'port', context="gui_settings_channel")
+
+            # 'user_input' is a generic rule. For band, a specific rule like 'hotspot_band' would be better.
+            validator.validate(band, 'user_input', context="gui_settings_band")
+
+            # QSpinBox provides its own range validation.
+            # If we wanted to use our validator, it would be:
+            # validator.validate(max_clients_val, 'port', context="gui_settings_max_clients")
+            # However, QSpinBox.value() is already an int within the set range.
+
+            # If all validations pass
+            super().accept() # This will close the dialog with QDialog.Accepted
+
+        except ValidationError as e:
+            QMessageBox.warning(self, "Input Validation Error", f"Error in advanced settings:\n{str(e)}")
+            # Dialog will not close due to not calling super().accept()
+        except AttributeError as ae:
+            # This might happen if parent_gui is None or has no validator
+            QMessageBox.critical(self, "Internal Error", f"Could not access validator: {ae}")
+
+
     def get_settings(self):
         """Get the configured settings"""
         settings = {}
@@ -456,6 +511,7 @@ class HotspotGUI(QMainWindow):
         super().__init__()
         
         # Initialize core components
+        self.validator = get_validator()
         self.hotspot_manager = HotspotManager()
         self.monitor_thread = None
         self.settings = QSettings('HotspotManager', 'HotspotTool')
@@ -696,6 +752,42 @@ class HotspotGUI(QMainWindow):
         layout.addStretch()
         
         self.tab_widget.addTab(tab, "Settings")
+
+    def apply_settings(self):
+        """Apply general application settings"""
+        self.statusBar().showMessage("Applying settings...")
+
+        # Retrieve settings from GUI elements in the "Settings" tab
+        autostart = self.autostart_check.isChecked()
+        minimize_to_tray = self.minimize_tray_check.isChecked()
+        save_logs = self.save_logs_check.isChecked()
+        mac_filter_enabled = self.mac_filter_check.isChecked() # Example, if this is a setting
+        access_control_enabled = self.access_control_check.isChecked() # Example
+
+        # In a real application, these would be validated if they were free-text or complex.
+        # For checkboxes, the value is boolean and inherently valid in terms of type.
+        # If these settings involved text inputs or numeric values, validation would be like:
+        # try:
+        #     validated_log_path = self.validator.validate(self.log_path_edit.text(), 'filename', context="gui_settings_log_path")
+        #     # ... more validations
+        # except ValidationError as e:
+        #     QMessageBox.warning(self, "Input Validation Error", f"Error in application settings:\n{str(e)}")
+        #     self.statusBar().showMessage("Failed to apply settings: Input error.")
+        #     return
+
+        # Save settings using QSettings
+        self.settings.setValue("autostart", autostart)
+        self.settings.setValue("minimizeToTray", minimize_to_tray)
+        self.settings.setValue("saveLogs", save_logs)
+        self.settings.setValue("macFilterEnabled", mac_filter_enabled)
+        self.settings.setValue("accessControlEnabled", access_control_enabled)
+
+        self.statusBar().showMessage("Settings applied successfully.")
+        QMessageBox.information(self, "Settings Applied", "Application settings have been saved.")
+
+        # Some settings might require immediate action, e.g., enabling/disabling a feature.
+        # For example, if 'save_logs' changed, you might reconfigure a logger.
+        # If autostart changed, you might need to update systemd service or equivalent.
     
     def init_system_tray(self):
         """Initialize system tray icon"""

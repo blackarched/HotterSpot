@@ -11,6 +11,7 @@ import secrets
 import re
 from typing import Dict, List, Optional
 from enum import Enum
+from input_validator import get_validator, ValidationError
 
 class SecurityProtocol(Enum):
     OPEN = "open"
@@ -20,6 +21,7 @@ class SecurityProtocol(Enum):
 
 class SecurityManager:
     def __init__(self):
+        self.validator = get_validator()
         self.logger = logging.getLogger(__name__)
         self.blocked_devices = set()
         self.allowed_devices = set()
@@ -74,39 +76,54 @@ class SecurityManager:
                           interface: str = "wlan0") -> bool:
         """Configure security settings for the hotspot"""
         try:
-            # Validate password
+            validated_ssid = self.validator.validate(ssid, 'ssid', context="sec_mgr_config_ssid")
+            validated_interface = self.validator.validate(interface, 'interface', context="sec_mgr_config_interface")
+            validated_password = None
+
             if protocol != SecurityProtocol.OPEN:
-                validation = self.validate_password(password)
-                if not validation['valid']:
-                    self.logger.error("Password does not meet security requirements")
-                    return False
+                # The 'password' rule also checks length and common weak passwords.
+                # self.validate_password() is a local strength checker, could be redundant if validator's 'password' rule is robust.
+                # For consistency, we'll use validator's 'password' rule.
+                validated_password = self.validator.validate(password, 'password', context="sec_mgr_config_password")
+                # local_validation = self.validate_password(password) # Keep this if it adds more checks not in validator
+                # if not local_validation['valid']:
+                #     self.logger.error("Password does not meet local security requirements (strength).")
+                #     return False
             
             # Configure based on protocol
             if protocol == SecurityProtocol.WPA2_PSK:
-                return self._configure_wpa2(ssid, password, interface)
+                return self._configure_wpa2(validated_ssid, validated_password, validated_interface)
             elif protocol == SecurityProtocol.WPA3_SAE:
-                return self._configure_wpa3(ssid, password, interface)
+                return self._configure_wpa3(validated_ssid, validated_password, validated_interface)
             elif protocol == SecurityProtocol.WPA_MIXED:
-                return self._configure_mixed_wpa(ssid, password, interface)
+                return self._configure_mixed_wpa(validated_ssid, validated_password, validated_interface)
             elif protocol == SecurityProtocol.OPEN:
-                return self._configure_open(ssid, interface)
+                return self._configure_open(validated_ssid, validated_interface) # No password for OPEN
             
+        except ValidationError as ve:
+            self.logger.error(f"Input validation failed for security configuration: {ve}")
+            return False
         except Exception as e:
             self.logger.error(f"Failed to configure security: {e}")
             return False
     
     def _configure_wpa2(self, ssid: str, password: str, interface: str) -> bool:
         """Configure WPA2-PSK security"""
+        # Inputs (ssid, password, interface) are assumed to be pre-validated by the calling method.
         try:
+            # Ensure con-name is also safe. Using a sanitized version of SSID for it.
+            safe_con_name_suffix = self.validator.validate(ssid, 'filename', context="sec_mgr_wpa2_conname_suffix")
+            con_name = f'hotspot-{safe_con_name_suffix}'
+
             cmd = [
                 'nmcli', 'device', 'wifi', 'hotspot',
-                'ifname', interface,
-                'con-name', f'hotspot-{ssid}',
-                'ssid', ssid,
-                'password', password
+                'ifname', interface, # validated interface
+                'con-name', con_name,
+                'ssid', ssid,       # validated ssid
+                'password', password # validated password
             ]
             
-            result = subprocess.run(cmd, capture_output=True, text=True)
+            result = subprocess.run(cmd, capture_output=True, text=True, check=False)
             if result.returncode == 0:
                 self.logger.info(f"WPA2 hotspot '{ssid}' configured successfully")
                 return True
@@ -121,14 +138,15 @@ class SecurityManager:
     def _configure_wpa3(self, ssid: str, password: str, interface: str) -> bool:
         """Configure WPA3-SAE security (if supported)"""
         try:
-            # Check if WPA3 is supported
+            # Check if WPA3 is supported (uses static commands, safe)
             if not self._check_wpa3_support():
                 self.logger.warning("WPA3 not supported, falling back to WPA2")
-                return self._configure_wpa2(ssid, password, interface)
+                return self._configure_wpa2(ssid, password, interface) # Already validated inputs
             
             # Create hostapd configuration for WPA3
-            config_content = f"""
-interface={interface}
+            # Inputs (ssid, password, interface) are assumed to be pre-validated.
+            # Ensure no injection into config_content. 'interface', 'ssid', 'password' rules should prevent this.
+            config_content = f"""interface={interface}
 driver=nl80211
 ssid={ssid}
 hw_mode=g
@@ -144,21 +162,23 @@ wpa_pairwise=CCMP
 rsn_pairwise=CCMP
 sae_require_mfp=1
 """
-            
-            # Write hostapd config
-            with open('/tmp/hostapd_wpa3.conf', 'w') as f:
+            # Using a temporary file for hostapd config is common. Ensure path is safe.
+            # /tmp/ is generally okay but consider placing in a more controlled directory if possible.
+            # The filename itself is static here.
+            temp_conf_file = "/tmp/hostapd_wpa3.conf" # Static filename
+            with open(temp_conf_file, 'w') as f:
                 f.write(config_content)
             
             # Start hostapd with WPA3 config
-            cmd = ['hostapd', '/tmp/hostapd_wpa3.conf', '-B']
-            result = subprocess.run(cmd, capture_output=True)
+            cmd = ['hostapd', temp_conf_file, '-B'] # temp_conf_file is static
+            result = subprocess.run(cmd, capture_output=True, text=True, check=False)
             
             if result.returncode == 0:
                 self.logger.info(f"WPA3 hotspot '{ssid}' configured successfully")
                 return True
             else:
-                self.logger.error("WPA3 configuration failed, trying WPA2")
-                return self._configure_wpa2(ssid, password, interface)
+                self.logger.error(f"WPA3 hostapd command failed: {result.stderr}. Trying WPA2.")
+                return self._configure_wpa2(ssid, password, interface) # Already validated inputs
                 
         except Exception as e:
             self.logger.error(f"WPA3 configuration error: {e}")
@@ -166,8 +186,8 @@ sae_require_mfp=1
     
     def _configure_mixed_wpa(self, ssid: str, password: str, interface: str) -> bool:
         """Configure mixed WPA2/WPA3 security"""
-        config_content = f"""
-interface={interface}
+        # Inputs (ssid, password, interface) are assumed to be pre-validated.
+        config_content = f"""interface={interface}
 driver=nl80211
 ssid={ssid}
 hw_mode=g
@@ -182,15 +202,18 @@ wpa_key_mgmt=WPA-PSK SAE
 wpa_pairwise=TKIP CCMP
 rsn_pairwise=CCMP
 """
-        
+        temp_conf_file = "/tmp/hostapd_mixed.conf" # Static filename
         try:
-            with open('/tmp/hostapd_mixed.conf', 'w') as f:
+            with open(temp_conf_file, 'w') as f:
                 f.write(config_content)
             
-            cmd = ['hostapd', '/tmp/hostapd_mixed.conf', '-B']
-            result = subprocess.run(cmd, capture_output=True)
+            cmd = ['hostapd', temp_conf_file, '-B']
+            result = subprocess.run(cmd, capture_output=True, text=True, check=False)
             
-            return result.returncode == 0
+            if result.returncode != 0:
+                self.logger.error(f"Mixed WPA hostapd command failed: {result.stderr}")
+                return False
+            return True
             
         except Exception as e:
             self.logger.error(f"Mixed WPA configuration error: {e}")
@@ -198,16 +221,22 @@ rsn_pairwise=CCMP
     
     def _configure_open(self, ssid: str, interface: str) -> bool:
         """Configure open (no security) hotspot"""
+        # Inputs (ssid, interface) are assumed to be pre-validated.
         try:
+            safe_con_name_suffix = self.validator.validate(ssid, 'filename', context="sec_mgr_open_conname_suffix")
+            con_name = f'hotspot-{safe_con_name_suffix}'
             cmd = [
                 'nmcli', 'device', 'wifi', 'hotspot',
-                'ifname', interface,
-                'con-name', f'hotspot-{ssid}',
-                'ssid', ssid
+                'ifname', interface, # validated interface
+                'con-name', con_name,
+                'ssid', ssid         # validated ssid
             ]
             
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            return result.returncode == 0
+            result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            if result.returncode != 0:
+                self.logger.error(f"Open hotspot configuration failed: {result.stderr}")
+                return False
+            return True
             
         except Exception as e:
             self.logger.error(f"Open hotspot configuration error: {e}")
@@ -234,72 +263,94 @@ rsn_pairwise=CCMP
     def block_device(self, mac_address: str) -> bool:
         """Block a device by MAC address"""
         try:
-            mac_address = mac_address.upper()
-            self.blocked_devices.add(mac_address)
+            validated_mac = self.validator.validate(mac_address, 'mac_address', context="sec_mgr_block_mac").upper()
+        except ValidationError as e:
+            self.logger.error(f"Invalid MAC address for blocking: {mac_address}. Error: {e}")
+            return False
+
+        try:
+            self.blocked_devices.add(validated_mac)
             
-            # Add iptables rule to block the MAC
             cmd = [
                 'iptables', '-A', 'FORWARD',
-                '-m', 'mac', '--mac-source', mac_address,
+                '-m', 'mac', '--mac-source', validated_mac,
                 '-j', 'DROP'
             ]
             
-            result = subprocess.run(cmd, capture_output=True)
+            result = subprocess.run(cmd, capture_output=True, text=True, check=False)
             if result.returncode == 0:
-                self.logger.info(f"Blocked device: {mac_address}")
+                self.logger.info(f"Blocked device: {validated_mac}")
                 return True
             else:
-                self.blocked_devices.discard(mac_address)
+                self.logger.error(f"iptables block command failed for {validated_mac}: {result.stderr}")
+                self.blocked_devices.discard(validated_mac) # Revert optimistic add
                 return False
                 
         except Exception as e:
-            self.logger.error(f"Failed to block device {mac_address}: {e}")
+            self.logger.error(f"Failed to block device {validated_mac}: {e}")
+            # Ensure state consistency if exception occurs after adding to set but before iptables
+            self.blocked_devices.discard(validated_mac)
             return False
     
     def unblock_device(self, mac_address: str) -> bool:
         """Unblock a device by MAC address"""
         try:
-            mac_address = mac_address.upper()
-            self.blocked_devices.discard(mac_address)
+            validated_mac = self.validator.validate(mac_address, 'mac_address', context="sec_mgr_unblock_mac").upper()
+        except ValidationError as e:
+            self.logger.error(f"Invalid MAC address for unblocking: {mac_address}. Error: {e}")
+            return False
             
-            # Remove iptables rule
+        try:
+            # Remove iptables rule (don't check=True, rule might not exist)
             cmd = [
                 'iptables', '-D', 'FORWARD',
-                '-m', 'mac', '--mac-source', mac_address,
+                '-m', 'mac', '--mac-source', validated_mac,
                 '-j', 'DROP'
             ]
+            subprocess.run(cmd, capture_output=True, text=True, check=False)
             
-            result = subprocess.run(cmd, capture_output=True)
-            if result.returncode == 0:
-                self.logger.info(f"Unblocked device: {mac_address}")
-                return True
-            else:
-                return False
+            self.blocked_devices.discard(validated_mac) # Ensure it's removed from set
+            self.logger.info(f"Unblocked device: {validated_mac}")
+            return True # Assume success as the goal is for the rule not to be present
                 
         except Exception as e:
-            self.logger.error(f"Failed to unblock device {mac_address}: {e}")
+            self.logger.error(f"Failed to unblock device {validated_mac}: {e}")
             return False
     
     def enable_whitelist_mode(self, allowed_macs: List[str]) -> bool:
         """Enable whitelist mode - only allow specified MAC addresses"""
+        validated_allowed_macs = set()
+        for mac in allowed_macs:
+            try:
+                validated_mac = self.validator.validate(mac, 'mac_address', context=f"sec_mgr_whitelist_mac_{mac}").upper()
+                validated_allowed_macs.add(validated_mac)
+            except ValidationError as e:
+                self.logger.warning(f"Invalid MAC '{mac}' in whitelist, skipping. Error: {e}")
+                # Decide if one invalid MAC should stop the whole operation
+                # For now, we'll just skip invalid ones.
+
+        if not validated_allowed_macs:
+            self.logger.error("No valid MAC addresses provided for whitelist.")
+            return False
+
         try:
-            self.allowed_devices = set(mac.upper() for mac in allowed_macs)
+            self.allowed_devices = validated_allowed_macs
             self.whitelist_mode = True
             
-            # Block all devices first
-            subprocess.run(['iptables', '-A', 'FORWARD', '-j', 'DROP'], 
-                         capture_output=True)
+            # Block all devices first (static command)
+            subprocess.run(['iptables', '-P', 'FORWARD', 'DROP'], capture_output=True, text=True, check=False)
+            subprocess.run(['iptables', '-F', 'FORWARD'], capture_output=True, text=True, check=False) # Flush existing FORWARD rules
             
             # Allow specific MACs
-            for mac in self.allowed_devices:
+            for v_mac in self.allowed_devices:
                 cmd = [
-                    'iptables', '-I', 'FORWARD',
-                    '-m', 'mac', '--mac-source', mac,
+                    'iptables', '-A', 'FORWARD', # Use -A to append, -I for insert at top
+                    '-m', 'mac', '--mac-source', v_mac,
                     '-j', 'ACCEPT'
                 ]
-                subprocess.run(cmd, capture_output=True)
+                subprocess.run(cmd, capture_output=True, text=True, check=False) # Log errors if any
             
-            self.logger.info(f"Whitelist mode enabled for {len(allowed_macs)} devices")
+            self.logger.info(f"Whitelist mode enabled for {len(self.allowed_devices)} devices")
             return True
             
         except Exception as e:

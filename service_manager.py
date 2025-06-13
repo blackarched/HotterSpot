@@ -18,6 +18,7 @@ from enum import Enum
 import json
 from production_logger import get_logger
 from error_handler import get_error_handler, with_error_handling, ErrorCategory, ErrorSeverity
+from input_validator import get_validator, ValidationError
 
 class ServiceStatus(Enum):
     STOPPED = "stopped"
@@ -43,6 +44,7 @@ class ServiceManager:
     """System service management and integration"""
     
     def __init__(self):
+        self.validator = get_validator()
         self.logger = get_logger()
         self.error_handler = get_error_handler()
         self.services = {}
@@ -83,21 +85,31 @@ class ServiceManager:
             return False
         
         # Reload systemd and enable service
+        try:
+            # Assuming service name should conform to filename-like rules, or a specific service name pattern
+            validated_service_name = self.validator.validate(config.name, 'filename', context="service_mgr_install_service_name")
+        except ValidationError as e:
+            self.logger.error(f"Invalid service name for installation: {config.name}. Error: {e}", component="service_manager")
+            return False
+
         commands = [
             ["systemctl", "daemon-reload"],
-            ["systemctl", "enable", config.name],
+            ["systemctl", "enable", validated_service_name],
         ]
         
         for cmd in commands:
-            result = subprocess.run(cmd, capture_output=True, text=True)
+            result = subprocess.run(cmd, capture_output=True, text=True, check=False)
             if result.returncode != 0:
                 self.logger.error(
                     f"Command failed: {' '.join(cmd)}\nError: {result.stderr}",
                     component="service_manager"
                 )
+                # Clean up service file if enable failed?
+                if service_file.exists():
+                    service_file.unlink(missing_ok=True)
                 return False
         
-        self.services[config.name] = config
+        self.services[validated_service_name] = config # Store with validated name if it's used as key elsewhere
         self.logger.audit("service_installed", details={"service": config.name})
         return True
     
@@ -110,23 +122,32 @@ class ServiceManager:
         # Stop service first
         self.stop_service(service_name)
         
+        try:
+            validated_service_name = self.validator.validate(service_name, 'filename', context="service_mgr_uninstall_service_name")
+        except ValidationError as e:
+            self.logger.error(f"Invalid service name for uninstallation: {service_name}. Error: {e}", component="service_manager")
+            return False
+
         # Disable and remove service
         commands = [
-            ["systemctl", "disable", service_name],
+            ["systemctl", "disable", validated_service_name],
             ["systemctl", "daemon-reload"]
         ]
         
         for cmd in commands:
-            subprocess.run(cmd, capture_output=True, text=True)
+            subprocess.run(cmd, capture_output=True, text=True, check=False) # Allow failure if service not found
         
         # Remove service file
-        service_file = self.systemd_dir / f"{service_name}.service"
+        service_file = self.systemd_dir / f"{validated_service_name}.service"
         if service_file.exists():
-            service_file.unlink()
-        
+            try:
+                service_file.unlink()
+            except OSError as e_unlink:
+                self.logger.warning(f"Could not remove service file {service_file}: {e_unlink}", component="service_manager")
+
         # Remove from tracking
-        if service_name in self.services:
-            del self.services[service_name]
+        if validated_service_name in self.services:
+            del self.services[validated_service_name]
         
         self.logger.audit("service_uninstalled", details={"service": service_name})
         return True
@@ -134,14 +155,19 @@ class ServiceManager:
     @with_error_handling(ErrorCategory.SYSTEM, "start_service", ErrorSeverity.MEDIUM)
     def start_service(self, service_name: str) -> bool:
         """Start system service"""
+        try:
+            validated_service_name = self.validator.validate(service_name, 'filename', context="service_mgr_start_service_name")
+        except ValidationError as e:
+            self.logger.error(f"Invalid service name for start: {service_name}. Error: {e}", component="service_manager")
+            return False
         
         result = subprocess.run(
-            ["systemctl", "start", service_name],
-            capture_output=True, text=True
+            ["systemctl", "start", validated_service_name],
+            capture_output=True, text=True, check=False
         )
         
         if result.returncode == 0:
-            self.logger.info(f"Service started: {service_name}", component="service_manager")
+            self.logger.info(f"Service started: {validated_service_name}", component="service_manager")
             self.logger.audit("service_started", details={"service": service_name})
             return True
         else:
@@ -154,14 +180,19 @@ class ServiceManager:
     @with_error_handling(ErrorCategory.SYSTEM, "stop_service", ErrorSeverity.MEDIUM)
     def stop_service(self, service_name: str) -> bool:
         """Stop system service"""
-        
+        try:
+            validated_service_name = self.validator.validate(service_name, 'filename', context="service_mgr_stop_service_name")
+        except ValidationError as e:
+            self.logger.error(f"Invalid service name for stop: {service_name}. Error: {e}", component="service_manager")
+            return False
+
         result = subprocess.run(
-            ["systemctl", "stop", service_name],
-            capture_output=True, text=True
+            ["systemctl", "stop", validated_service_name],
+            capture_output=True, text=True, check=False
         )
         
         if result.returncode == 0:
-            self.logger.info(f"Service stopped: {service_name}", component="service_manager")
+            self.logger.info(f"Service stopped: {validated_service_name}", component="service_manager")
             self.logger.audit("service_stopped", details={"service": service_name})
             return True
         else:
@@ -173,11 +204,16 @@ class ServiceManager:
     
     def get_service_status(self, service_name: str) -> ServiceStatus:
         """Get current service status"""
-        
+        try:
+            validated_service_name = self.validator.validate(service_name, 'filename', context="service_mgr_status_service_name")
+        except ValidationError as e:
+            self.logger.error(f"Invalid service name for status check: {service_name}. Error: {e}", component="service_manager")
+            return ServiceStatus.UNKNOWN
+
         try:
             result = subprocess.run(
-                ["systemctl", "is-active", service_name],
-                capture_output=True, text=True
+                ["systemctl", "is-active", validated_service_name],
+                capture_output=True, text=True, check=False
             )
             
             status_map = {
@@ -195,14 +231,19 @@ class ServiceManager:
     
     def restart_service(self, service_name: str) -> bool:
         """Restart system service"""
-        
+        try:
+            validated_service_name = self.validator.validate(service_name, 'filename', context="service_mgr_restart_service_name")
+        except ValidationError as e:
+            self.logger.error(f"Invalid service name for restart: {service_name}. Error: {e}", component="service_manager")
+            return False
+
         result = subprocess.run(
-            ["systemctl", "restart", service_name],
-            capture_output=True, text=True
+            ["systemctl", "restart", validated_service_name],
+            capture_output=True, text=True, check=False
         )
         
         if result.returncode == 0:
-            self.logger.info(f"Service restarted: {service_name}", component="service_manager")
+            self.logger.info(f"Service restarted: {validated_service_name}", component="service_manager")
             self.logger.audit("service_restarted", details={"service": service_name})
             return True
         else:
@@ -362,7 +403,7 @@ User={config.user}
 Group={config.group}
 ExecStart={config.exec_path}
 WorkingDirectory={config.working_directory}
-Restart={config.restart_policy}
+        Restart={self.validator.validate(config.restart_policy, 'user_input', context="service_config_restart_policy")}
 RestartSec=5
 StandardOutput=journal
 StandardError=journal
@@ -381,20 +422,28 @@ WantedBy=multi-user.target
     
     def get_service_logs(self, service_name: str, lines: int = 100) -> str:
         """Get service logs from journald"""
-        
+        try:
+            validated_service_name = self.validator.validate(service_name, 'filename', context="service_mgr_logs_service_name")
+            # Ensure 'lines' is a valid number
+            if not isinstance(lines, int) or lines <= 0:
+                lines = 100 # default to 100 if invalid
+        except ValidationError as e:
+            self.logger.error(f"Invalid service name for logs: {service_name}. Error: {e}", component="service_manager")
+            return f"Invalid service name: {service_name}"
+
         try:
             result = subprocess.run(
-                ["journalctl", "-u", service_name, "-n", str(lines), "--no-pager"],
-                capture_output=True, text=True
+                ["journalctl", "-u", validated_service_name, "-n", str(lines), "--no-pager"],
+                capture_output=True, text=True, check=False
             )
             
             if result.returncode == 0:
                 return result.stdout
             else:
-                return f"Error getting logs: {result.stderr}"
+                return f"Error getting logs for {validated_service_name}: {result.stderr}"
                 
         except Exception as e:
-            return f"Error getting logs: {e}"
+            return f"Error getting logs for {validated_service_name}: {e}"
     
     def cleanup(self):
         """Cleanup on shutdown"""
@@ -421,13 +470,29 @@ class ProcessManager:
         """Start a managed process"""
         
         try:
+            # Validate each part of the command list if it can come from external source.
+            # Here, we assume 'command' list itself is constructed safely, but its *elements*
+            # should be validated if they originate from user input or config files.
+            # For example, if command = ['/usr/bin/myprog', user_supplied_arg1, user_supplied_arg2],
+            # then user_supplied_arg1 and user_supplied_arg2 need prior validation.
+            # The 'command' rule in input_validator is for a single command string, not list elements.
+
+            # Basic check: ensure all parts of command are strings
+            if not all(isinstance(arg, str) for arg in command):
+                self.logger.error(f"Command list for process '{name}' contains non-string arguments.", component="process_manager")
+                return None
+
+            # Further validation would depend on the source of 'command' elements.
+            # If command[0] (the executable) can be influenced by external input, it's high risk.
+            # For now, we proceed assuming 'command' is constructed with validated/safe components.
+
             proc = subprocess.Popen(
-                command,
-                cwd=cwd,
-                env=env,
+                command, # Use the validated command list
+                cwd=cwd, # cwd should be validated if from external source
+                env=env, # env vars should be validated if from external source
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                start_new_session=True
+                start_new_session=True # Detaches from parent, good for services
             )
             
             with self._lock:

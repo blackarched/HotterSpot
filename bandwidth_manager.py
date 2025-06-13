@@ -9,9 +9,11 @@ import logging
 from typing import Dict, Optional
 import psutil
 import time
+from input_validator import get_validator, ValidationError
 
 class BandwidthManager:
     def __init__(self):
+        self.validator = get_validator()
         self.system = platform.system().lower()
         self.logger = logging.getLogger(__name__)
         self.active_limits = {}
@@ -27,8 +29,14 @@ class BandwidthManager:
     def _set_linux_bandwidth_limit(self, interface: str, download_mbps: float, upload_mbps: float) -> bool:
         """Set bandwidth limits on Linux using tc (traffic control)"""
         try:
+            validated_interface = self.validator.validate(interface, 'interface', context="bw_manager_set_limit_interface")
+        except ValidationError as e:
+            self.logger.error(f"Invalid interface name for bandwidth limit: {interface}. Error: {e}")
+            return False
+
+        try:
             # Clear existing rules
-            self.clear_bandwidth_limits(interface)
+            self.clear_bandwidth_limits(validated_interface) # Use validated interface
             
             # Convert Mbps to Kbps
             download_kbps = int(download_mbps * 1000)
@@ -36,22 +44,22 @@ class BandwidthManager:
             
             # Add root qdisc
             subprocess.run([
-                "tc", "qdisc", "add", "dev", interface, "root", "handle", "1:", "htb", "default", "30"
+                "tc", "qdisc", "add", "dev", validated_interface, "root", "handle", "1:", "htb", "default", "30"
             ], check=True)
             
             # Add class for total bandwidth
             subprocess.run([
-                "tc", "class", "add", "dev", interface, "parent", "1:", "classid", "1:1", "htb",
+                "tc", "class", "add", "dev", validated_interface, "parent", "1:", "classid", "1:1", "htb",
                 "rate", f"{upload_kbps}kbit", "ceil", f"{upload_kbps}kbit"
             ], check=True)
             
             # Add default class
             subprocess.run([
-                "tc", "class", "add", "dev", interface, "parent", "1:1", "classid", "1:30", "htb",
+                "tc", "class", "add", "dev", validated_interface, "parent", "1:1", "classid", "1:30", "htb",
                 "rate", f"{upload_kbps}kbit", "ceil", f"{upload_kbps}kbit"
             ], check=True)
             
-            self.active_limits[interface] = {
+            self.active_limits[validated_interface] = { # Use validated interface
                 'download_mbps': download_mbps,
                 'upload_mbps': upload_mbps
             }
@@ -85,15 +93,21 @@ class BandwidthManager:
     def clear_bandwidth_limits(self, interface: str) -> bool:
         """Clear bandwidth limits for interface"""
         try:
+            validated_interface = self.validator.validate(interface, 'interface', context="bw_manager_clear_limit_interface")
+        except ValidationError as e:
+            self.logger.error(f"Invalid interface name for clearing bandwidth limits: {interface}. Error: {e}")
+            return False
+
+        try:
             if self.system == "linux":
                 subprocess.run([
-                    "tc", "qdisc", "del", "dev", interface, "root"
-                ], capture_output=True)
+                    "tc", "qdisc", "del", "dev", validated_interface, "root"
+                ], capture_output=True) # Note: check=False here, so we don't crash if qdisc doesn't exist
                 
-            if interface in self.active_limits:
-                del self.active_limits[interface]
+            if validated_interface in self.active_limits:
+                del self.active_limits[validated_interface]
                 
-            self.logger.info(f"Bandwidth limits cleared for {interface}")
+            self.logger.info(f"Bandwidth limits cleared for {validated_interface}")
             return True
             
         except Exception as e:
@@ -163,8 +177,15 @@ class BandwidthManager:
         try:
             # This requires more advanced tc configuration
             # Simplified implementation
-            self.logger.warning("Per-device bandwidth limiting requires advanced configuration")
-            return False
+            # Validate IP address if we were to use it in a command
+            try:
+                validated_ip = self.validator.validate(ip_address, 'ip_address', context="bw_manager_per_device_ip")
+            except ValidationError as e_ip:
+                self.logger.error(f"Invalid IP address for per-device limit: {ip_address}. Error: {e_ip}")
+                return False
+
+            self.logger.warning("Per-device bandwidth limiting requires advanced configuration using validated_ip")
+            return False # Current implementation is a placeholder
             
         except Exception as e:
             self.logger.error(f"Failed to set per-device limit: {e}")
