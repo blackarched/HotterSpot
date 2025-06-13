@@ -231,7 +231,7 @@ setup_installation() {
         for py_file in "$SCRIPT_DIR"/*.py; do
             base_name=$(basename "$py_file")
             # Check if the file is not the setup script itself or the uninstall script
-            if [ "$base_name" == "linux_hotspot_main.py" ]; then
+            if [ "$base_name" == "linux_hotspot_main.py" ] || [ "$base_name" == "hotterspot_daemon.py" ]; then
                 cp "$py_file" "$INSTALL_DIR/$base_name"
                 chmod +x "$INSTALL_DIR/$base_name"
                 log "Copied and made executable: $INSTALL_DIR/$base_name"
@@ -307,7 +307,7 @@ setup_systemd_service() {
     SERVICE_FILE="/etc/systemd/system/hotspot-manager.service"
     # Use the python from the virtual environment
     PYTHON_EXEC="$INSTALL_DIR/venv/bin/python3"
-    MAIN_SCRIPT="$INSTALL_DIR/linux_hotspot_main.py"
+    DAEMON_SCRIPT="$INSTALL_DIR/hotterspot_daemon.py" # Changed to daemon script
 
     cat > "$SERVICE_FILE" << EOF
 [Unit]
@@ -316,11 +316,10 @@ After=network.target
 
 [Service]
 Type=simple
-# Ensure linux_hotspot_main.py handles daemonization correctly or change Type to forking
-ExecStart=$PYTHON_EXEC $MAIN_SCRIPT --daemon
+ExecStart=$PYTHON_EXEC $DAEMON_SCRIPT
 WorkingDirectory=$INSTALL_DIR
-User=root # Consider if a non-root user could be used with appropriate capabilities
-Group=root # Or a dedicated group
+User=root
+Group=root
 Restart=on-failure
 RestartSec=5
 StartLimitIntervalSec=0 # Or a reasonable interval like 60s with StartLimitBurst=5

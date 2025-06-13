@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 """
-Linux Hotspot Manager - Production Ready Application
-A comprehensive hotspot management tool for Linux systems
+HotterSpot: Comprehensive Linux Hotspot Management Tool
 """
 
 import sys
@@ -12,561 +13,295 @@ import time
 import json
 import re
 import signal
-from datetime import datetime
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+import argparse
 
 try:
-    from PyQt5.QtWidgets import (
-        QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-        QGridLayout, QLabel, QLineEdit, QPushButton, QComboBox,
-        QTextEdit, QGroupBox, QCheckBox, QSpinBox, QSlider,
-        QTabWidget, QTableWidget, QTableWidgetItem, QProgressBar,
-        QSystemTrayIcon, QMenu, QAction, QMessageBox, QSplashScreen,
-        QFrame, QScrollArea, QDialog, QDialogButtonBox, QFormLayout
-    )
-    from PyQt5.QtCore import (
-        QThread, pyqtSignal, QTimer, Qt, QSettings, QSize,
-        QPropertyAnimation, QEasingCurve, QRect
-    )
-    from PyQt5.QtGui import (
-        QFont, QIcon, QPixmap, QPainter, QColor, QPalette,
-        QLinearGradient, QBrush, QMovie
-    )
-# Ensure QMessageBox is available, it's usually part of QtWidgets.*
-# from PyQt5.QtWidgets import QMessageBox (already covered by wildcard import if that's used)
+    from PyQt5.QtCore import (Qt, QTimer, QThread, pyqtSignal, QSettings, QSize, QPoint, QProcess, QMetaObject)
+    from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+                                 QPushButton, QLabel, QLineEdit, QComboBox, QTextEdit, QGroupBox,
+                                 QCheckBox, QTabWidget, QTableWidget, QTableWidgetItem,
+                                 QMessageBox, QSystemTrayIcon, QMenu, QAction, QSizePolicy,
+                                 QGridLayout, QFormLayout, QDialog, QDialogButtonBox,
+                                 QProgressDialog, QStyle, qApp)
+    from PyQt5.QtGui import QIcon, QFont, QPalette, QColor
+    PYQT5_AVAILABLE = True
+except ImportError:
+    PYQT5_AVAILABLE = False
+    # Add dummy classes for headless mode if PyQt5 is not available
+    class QMainWindow: pass
+    class QApplication: pass
+    class QWidget: pass
+    # ... any other PyQt5 classes that might be referenced in type hints or shared code paths
 
-from input_validator import get_validator, ValidationError
-
-# Imports for daemon mode
-import argparse
+from production_logger import get_logger, log_info, log_error, log_warning, log_debug, log_exception
 from config_manager import ConfigManager
-# HotspotManager class is defined in this file.
-from service_manager import ServiceManager # ServiceConfig might not be needed at this top level
-from production_logger import get_logger
-# Other managers for daemon mode can be imported if/when run_daemon_mode is fleshed out
+from hotspot_manager import HotspotManager
+from firewall_manager import FirewallManager
+from user_manager import UserManager
+from captive_portal import CaptivePortal
+from bandwidth_manager import BandwidthManager
+from network_monitor import NetworkMonitor
+from system_monitor import SystemMonitor
+from status_logger import StatusLogger
+from input_validator import get_validator, ValidationError
+from service_manager import ServiceManager # For controlling other services or potentially self
 
-except ImportError: # This block is for PyQt5, keep it as is
-    print("PyQt5 not found. Installing...")
-    subprocess.run([sys.executable, "-m", "pip", "install", "PyQt5"], check=True)
-    from PyQt5.QtWidgets import * # QMessageBox is here
-    from PyQt5.QtCore import *
-    from PyQt5.QtGui import *
-    # Need to re-import for validator if initial try failed
-    from input_validator import get_validator, ValidationError
+APP_NAME = "HotterSpot"
+MAIN_SERVICE_NAME = "hotterspot" # If we need to interact with our own systemd service
 
+# Global stop event for daemon mode
+daemon_stop_event = threading.Event()
 
-import psutil
-import netifaces
+class HeadlessApplication:
+    """
+    Manages HotterSpot in daemon (headless) mode.
+    """
+    def __init__(self, config_manager, logger):
+        self.config_manager = config_manager
+        self.logger = logger
+        log_info("Initializing HeadlessApplication...", logger=self.logger)
 
+        self.firewall_manager = FirewallManager(self.config_manager, logger=self.logger)
+        self.hotspot_manager = HotspotManager(self.config_manager, self.firewall_manager, logger=self.logger)
+        # UserManager might be needed if Captive Portal uses it directly for auth beyond MAC
+        self.user_manager = UserManager(db_path=self.config_manager.get_config().get('user_database_path'), logger=self.logger)
+        self.captive_portal = CaptivePortal(self.config_manager, self.user_manager, self.firewall_manager, logger=self.logger)
 
-class NetworkInterface:
-    """Manages network interface detection and configuration"""
-    
-    @staticmethod
-    def get_wireless_interfaces() -> List[str]:
-        """Get all available wireless interfaces"""
-        interfaces = []
+        self.network_monitor = NetworkMonitor(logger=self.logger)
+        self.system_monitor = SystemMonitor(logger=self.logger)
+        # StatusLogger might be less relevant for daemon if not writing to a GUI/specific status file
+        # self.status_logger = StatusLogger(config_manager, logger=self.logger)
+
+        self.auto_start_hotspot = self.config_manager.get_config().get('auto_start_hotspot_daemon', False)
+        self.captive_portal_enabled = self.config_manager.get_config().get('captive_portal_enabled', False)
+
+    def start(self):
+        log_info("Starting HotterSpot in daemon mode...", logger=self.logger)
         try:
-            result = subprocess.run(['iwconfig'], capture_output=True, text=True, stderr=subprocess.DEVNULL)
-            for line in result.stdout.split('\n'):
-                if 'IEEE 802.11' in line:
-                    interface = line.split()[0]
-                    interfaces.append(interface)
-        except (subprocess.SubprocessError, FileNotFoundError):
-            # Fallback method
-            for interface in netifaces.interfaces():
-                if interface.startswith(('wlan', 'wlp')):
-                    interfaces.append(interface)
-        return interfaces
-    
-    @staticmethod
-    def get_ethernet_interfaces() -> List[str]:
-        """Get all available ethernet interfaces"""
-        interfaces = []
-        for interface in netifaces.interfaces():
-            if interface.startswith(('eth', 'enp', 'eno')):
-                interfaces.append(interface)
-        return interfaces
-    
-    @staticmethod
-    def get_interface_info(interface: str) -> Dict:
-        """Get detailed information about a network interface"""
-        info = {'name': interface, 'ip': None, 'status': 'down'}
-        try:
-            addrs = netifaces.ifaddresses(interface)
-            if netifaces.AF_INET in addrs:
-                info['ip'] = addrs[netifaces.AF_INET][0]['addr']
-                info['status'] = 'up'
-        except Exception:
-            pass
-        return info
+            self.config_manager.load_config() # Ensure latest config is loaded
+        except Exception as e:
+            log_error(f"Daemon: Failed to load configuration: {e}", logger=self.logger)
+            return False # Cannot start without config
 
-
-class HotspotManager:
-    """Core hotspot management functionality"""
-    
-    def __init__(self):
-        self.is_active = False
-        self.connection_name = "HotspotManager"
-        self.current_config = {}
-        
-    def check_dependencies(self) -> Tuple[bool, List[str]]:
-        """Check if required tools are available"""
-        required_tools = ['nmcli', 'hostapd', 'dnsmasq', 'iptables']
-        missing = []
-        
-        for tool in required_tools:
+        if self.auto_start_hotspot:
+            log_info("Daemon: Auto-starting hotspot...", logger=self.logger)
             try:
-                subprocess.run(['which', tool], capture_output=True, check=True)
-            except subprocess.CalledProcessError:
-                missing.append(tool)
-        
-        return len(missing) == 0, missing
-    
-    def create_hotspot(self, config: Dict) -> Tuple[bool, str]:
-        """Create and start the hotspot"""
-        try:
-            # Stop any existing hotspot
-            self.stop_hotspot()
-            
-            # Validate configuration
-            if not self._validate_config(config):
-                return False, "Invalid configuration parameters"
-            
-            # Create the hotspot connection
-            cmd = [
-                'nmcli', 'device', 'wifi', 'hotspot',
-                'ifname', config['interface'],
-                'con-name', self.connection_name,
-                'ssid', config['ssid'],
-                'password', config['password']
-            ]
-            
-            if config.get('band'):
-                cmd.extend(['band', config['band']])
-            
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            
-            if result.returncode != 0:
-                return False, f"Failed to create hotspot: {result.stderr}"
-            
-            # Configure additional settings
-            self._configure_advanced_settings(config)
-            
-            # Start internet sharing
-            if config.get('share_internet'):
-                self._setup_internet_sharing(config)
-            
-            self.is_active = True
-            self.current_config = config.copy()
-            
-            return True, "Hotspot created successfully"
-            
-        except Exception as e:
-            return False, f"Error creating hotspot: {str(e)}"
-    
-    def stop_hotspot(self) -> Tuple[bool, str]:
-        """Stop the hotspot"""
-        try:
-            # Stop the connection
-            subprocess.run(['nmcli', 'connection', 'down', self.connection_name], 
-                         capture_output=True)
-            
-            # Delete the connection
-            subprocess.run(['nmcli', 'connection', 'delete', self.connection_name], 
-                         capture_output=True)
-            
-            # Clean up internet sharing
-            self._cleanup_internet_sharing()
-            
-            self.is_active = False
-            self.current_config = {}
-            
-            return True, "Hotspot stopped successfully"
-            
-        except Exception as e:
-            return False, f"Error stopping hotspot: {str(e)}"
-    
-    def get_connected_devices(self) -> List[Dict]:
-        """Get list of connected devices"""
-        devices = []
-        try:
-            # Get DHCP leases
-            lease_files = ['/var/lib/dhcp/dhcpd.leases', '/var/lib/dhcpcd5/dhcpcd.leases']
-            
-            for lease_file in lease_files:
-                if os.path.exists(lease_file):
-                    devices.extend(self._parse_dhcp_leases(lease_file))
-            
-            # Get ARP table
-            arp_devices = self._get_arp_devices()
-            
-            # Merge and deduplicate
-            device_map = {}
-            for device in devices + arp_devices:
-                mac = device.get('mac')
-                if mac:
-                    device_map[mac] = device
-            
-            return list(device_map.values())
-            
-        except Exception:
-            return []
-    
-    def get_data_usage(self) -> Dict:
-        """Get data usage statistics"""
-        try:
-            stats = psutil.net_io_counters(pernic=True)
-            if self.current_config.get('interface') in stats:
-                interface_stats = stats[self.current_config['interface']]
-                return {
-                    'bytes_sent': interface_stats.bytes_sent,
-                    'bytes_recv': interface_stats.bytes_recv,
-                    'packets_sent': interface_stats.packets_sent,
-                    'packets_recv': interface_stats.packets_recv
-                }
-        except Exception:
-            pass
-        return {'bytes_sent': 0, 'bytes_recv': 0, 'packets_sent': 0, 'packets_recv': 0}
-    
-    def _validate_config(self, config: Dict) -> bool:
-        """Validate hotspot configuration"""
-        required_fields = ['interface', 'ssid', 'password']
-        
-        for field in required_fields:
-            if not config.get(field):
+                # HotspotManager expects these, get from config
+                main_config = self.config_manager.get_config()
+                ssid = main_config.get('hotspot_ssid', 'HotterSpot')
+                password = main_config.get('hotspot_password', 'password123')
+                interface = main_config.get('hotspot_interface')
+                if not interface: # Try to autodetect if not set
+                    # This needs to call the new hotspot_manager's method
+                    interfaces = self.hotspot_manager.get_available_interfaces() # Corrected
+                    interface = interfaces.get('wireless', [None])[0] if interfaces.get('wireless') else None
+
+                if not interface:
+                    log_error("Daemon: No suitable wireless interface found or configured for auto-start.", logger=self.logger)
+                    return False
+
+                self.hotspot_manager.create_hotspot(ssid, password, interface)
+                log_info(f"Daemon: Hotspot '{ssid}' initiated on interface '{interface}'.", logger=self.logger)
+
+                if self.captive_portal_enabled:
+                    log_info("Daemon: Starting captive portal...", logger=self.logger)
+                    self.captive_portal.start_portal()
+                else:
+                    log_info("Daemon: Captive portal is disabled in configuration.", logger=self.logger)
+
+            except Exception as e:
+                log_exception(f"Daemon: Error auto-starting hotspot: {e}", logger=self.logger)
                 return False
-        
-        if len(config['password']) < 8:
-            return False
-            
-        if len(config['ssid']) < 1 or len(config['ssid']) > 32:
-            return False
-            
+        else:
+            log_info("Daemon: Hotspot auto-start is disabled in configuration.", logger=self.logger)
+
+        # Start background monitoring services
+        # self.network_monitor.start_monitoring() # If needed
+        # self.system_monitor.start_monitoring() # If needed
+        # self.status_logger.start() # If needed
+
+        log_info("Daemon: HeadlessApplication started successfully.", logger=self.logger)
         return True
-    
-    def _configure_advanced_settings(self, config: Dict):
-        """Configure advanced hotspot settings"""
-        try:
-            # Set channel if specified
-            if config.get('channel'):
-                subprocess.run([
-                    'nmcli', 'connection', 'modify', self.connection_name,
-                    '802-11-wireless.channel', str(config['channel'])
-                ], capture_output=True)
-            
-            # Set max clients if specified
-            if config.get('max_clients'):
-                # This would require hostapd configuration
-                pass
-                
-        except Exception:
-            pass
-    
-    def _setup_internet_sharing(self, config: Dict):
-        """Setup internet connection sharing"""
-        try:
-            internet_interface = config.get('internet_interface')
-            hotspot_interface = config['interface']
-            
-            if not internet_interface:
-                return
-            
-            # Enable IP forwarding
-            subprocess.run(['sysctl', 'net.ipv4.ip_forward=1'], capture_output=True)
-            
-            # Setup iptables rules
-            subprocess.run([
-                'iptables', '-t', 'nat', '-A', 'POSTROUTING',
-                '-o', internet_interface, '-j', 'MASQUERADE'
-            ], capture_output=True)
-            
-            subprocess.run([
-                'iptables', '-A', 'FORWARD',
-                '-i', internet_interface, '-o', hotspot_interface,
-                '-m', 'state', '--state', 'RELATED,ESTABLISHED', '-j', 'ACCEPT'
-            ], capture_output=True)
-            
-            subprocess.run([
-                'iptables', '-A', 'FORWARD',
-                '-i', hotspot_interface, '-o', internet_interface,
-                '-j', 'ACCEPT'
-            ], capture_output=True)
-            
-        except Exception:
-            pass
-    
-    def _cleanup_internet_sharing(self):
-        """Clean up internet sharing configuration"""
-        try:
-            # Remove iptables rules
-            subprocess.run(['iptables', '-t', 'nat', '-F'], capture_output=True)
-            subprocess.run(['iptables', '-F', 'FORWARD'], capture_output=True)
-        except Exception:
-            pass
-    
-    def _parse_dhcp_leases(self, lease_file: str) -> List[Dict]:
-        """Parse DHCP lease file"""
-        devices = []
-        try:
-            with open(lease_file, 'r') as f:
-                content = f.read()
-                
-            # Simple parsing for common lease formats
-            lease_blocks = re.findall(r'lease ([\d.]+) {([^}]+)}', content)
-            
-            for ip, block in lease_blocks:
-                device = {'ip': ip}
-                
-                mac_match = re.search(r'hardware ethernet ([^;]+);', block)
-                if mac_match:
-                    device['mac'] = mac_match.group(1)
-                
-                hostname_match = re.search(r'client-hostname "([^"]+)"', block)
-                if hostname_match:
-                    device['hostname'] = hostname_match.group(1)
-                
-                devices.append(device)
-                
-        except Exception:
-            pass
-        return devices
-    
-    def _get_arp_devices(self) -> List[Dict]:
-        """Get devices from ARP table"""
-        devices = []
-        try:
-            result = subprocess.run(['arp', '-a'], capture_output=True, text=True)
-            
-            for line in result.stdout.split('\n'):
-                match = re.search(r'([^\s]+)\s+\(([\d.]+)\)\s+at\s+([^\s]+)', line)
-                if match:
-                    hostname, ip, mac = match.groups()
-                    devices.append({
-                        'hostname': hostname,
-                        'ip': ip,
-                        'mac': mac
-                    })
-        except Exception:
-            pass
-        return devices
 
-
-class MonitorThread(QThread):
-    """Background thread for monitoring hotspot status and connected devices"""
-    
-    status_updated = pyqtSignal(dict)
-    devices_updated = pyqtSignal(list)
-    data_updated = pyqtSignal(dict)
-    
-    def __init__(self, hotspot_manager):
-        super().__init__()
-        self.hotspot_manager = hotspot_manager
-        self.running = True
-        
-    def run(self):
-        """Main monitoring loop"""
-        while self.running:
-            try:
-                # Update status
-                status = {
-                    'is_active': self.hotspot_manager.is_active,
-                    'config': self.hotspot_manager.current_config
-                }
-                self.status_updated.emit(status)
-                
-                # Update connected devices
-                if self.hotspot_manager.is_active:
-                    devices = self.hotspot_manager.get_connected_devices()
-                    self.devices_updated.emit(devices)
-                    
-                    # Update data usage
-                    data_usage = self.hotspot_manager.get_data_usage()
-                    self.data_updated.emit(data_usage)
-                
-                time.sleep(2)  # Update every 2 seconds
-                
-            except Exception:
-                pass
-    
     def stop(self):
-        """Stop the monitoring thread"""
-        self.running = False
-        self.quit()
-        self.wait()
+        log_info("Stopping HotterSpot daemon mode...", logger=self.logger)
+        if self.captive_portal_enabled and self.captive_portal.is_running():
+            log_info("Daemon: Stopping captive portal...", logger=self.logger)
+            self.captive_portal.stop_portal()
 
+        # Check if hotspot is active using the new hotspot_manager method
+        if self.hotspot_manager.is_hotspot_active(): # Corrected to use actual method if available
+            log_info("Daemon: Stopping hotspot...", logger=self.logger)
+            self.hotspot_manager.stop_hotspot()
 
-class SettingsDialog(QDialog):
-    """Advanced settings dialog"""
-    
-    def __init__(self, parent=None, current_settings=None):
-        super().__init__(parent)
-        self.setWindowTitle("Advanced Settings")
-        self.setModal(True)
-        self.resize(400, 300)
-        
-        self.settings = current_settings or {}
-        self.init_ui()
-        
-    def init_ui(self):
-        """Initialize the settings dialog UI"""
-        layout = QVBoxLayout()
-        
-        # Create form layout
-        form_layout = QFormLayout()
-        
-        # Channel selection
-        self.channel_combo = QComboBox()
-        self.channel_combo.addItems(['Auto'] + [str(i) for i in range(1, 15)])
-        if self.settings.get('channel'):
-            self.channel_combo.setCurrentText(str(self.settings['channel']))
-        form_layout.addRow("Channel:", self.channel_combo)
-        
-        # Band selection
-        self.band_combo = QComboBox()
-        self.band_combo.addItems(['bg', 'a'])
-        if self.settings.get('band'):
-            self.band_combo.setCurrentText(self.settings['band'])
-        form_layout.addRow("Band:", self.band_combo)
-        
-        # Max clients
-        self.max_clients_spin = QSpinBox()
-        self.max_clients_spin.setRange(1, 50)
-        self.max_clients_spin.setValue(self.settings.get('max_clients', 10))
-        form_layout.addRow("Max Clients:", self.max_clients_spin)
-        
-        # Hidden network
-        self.hidden_check = QCheckBox()
-        self.hidden_check.setChecked(self.settings.get('hidden', False))
-        form_layout.addRow("Hidden Network:", self.hidden_check)
-        
-        layout.addLayout(form_layout)
-        
-        # Buttons
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
-        
-        self.setLayout(layout)
+        # Stop background monitoring
+        # if self.network_monitor.is_monitoring(): self.network_monitor.stop_monitoring()
+        # if self.system_monitor.is_monitoring(): self.system_monitor.stop_monitoring()
+        # if self.status_logger.is_running(): self.status_logger.stop()
+        log_info("Daemon: HeadlessApplication stopped.", logger=self.logger)
 
-    def accept(self):
-        """Validate settings before accepting the dialog."""
-        # Assuming self.parent() gives access to the validator if needed, or pass it in.
-        # For this example, let's assume validator is accessible via self.parent().validator
-        # This is not ideal; validator should ideally be passed to SettingsDialog or be a global singleton.
-        # HotspotGUI instance has self.validator.
-        # Since SettingsDialog is usually created with HotspotGUI as parent:
-        parent_gui = self.parent()
-        if not hasattr(parent_gui, 'validator'):
-            # Fallback if validator is not found, or log an error.
-            # This indicates a structural issue to be resolved for robust validation.
-            print("DEBUG: Validator not found on parent in SettingsDialog. Skipping validation.") # Should not happen with current structure
-            super().accept() # Proceed without validation if validator is missing
-            return
-
-        validator = parent_gui.validator
-
-        channel_text = self.channel_combo.currentText()
-        band = self.band_combo.currentText() # 'bg' or 'a'
-        max_clients_val = self.max_clients_spin.value() # This is already an int
-
+    def run_daemon_loop(self):
+        log_info("Daemon: Entering main loop. Press Ctrl+C to exit.", logger=self.logger)
         try:
-            if channel_text != 'Auto':
-                # 'port' rule expects int or string convertible to int, and validates range 1-65535
-                # Channel is 1-14. A custom rule or lambda in validator would be better.
-                # For now, 'port' ensures it's a number. Further logical validation might be needed.
-                validator.validate(channel_text, 'port', context="gui_settings_channel")
+            while not daemon_stop_event.is_set():
+                # Perform periodic checks or tasks if necessary
+                # Example: status = self.hotspot_manager.get_hotspot_status() # Corrected
+                # if self.auto_start_hotspot and status.get('status') != "active":
+                #    log_warning("Daemon: Hotspot seems to have gone down, attempting restart...", logger=self.logger)
+                #    self.start() # Or a more nuanced restart logic
 
-            # 'user_input' is a generic rule. For band, a specific rule like 'hotspot_band' would be better.
-            validator.validate(band, 'user_input', context="gui_settings_band")
+                daemon_stop_event.wait(timeout=self.config_manager.get_config().get('daemon_loop_interval', 60))
+        finally:
+            self.stop()
 
-            # QSpinBox provides its own range validation.
-            # If we wanted to use our validator, it would be:
-            # validator.validate(max_clients_val, 'port', context="gui_settings_max_clients")
-            # However, QSpinBox.value() is already an int within the set range.
-
-            # If all validations pass
-            super().accept() # This will close the dialog with QDialog.Accepted
-
-        except ValidationError as e:
-            QMessageBox.warning(self, "Input Validation Error", f"Error in advanced settings:\n{str(e)}")
-            # Dialog will not close due to not calling super().accept()
-        except AttributeError as ae:
-            # This might happen if parent_gui is None or has no validator
-            QMessageBox.critical(self, "Internal Error", f"Could not access validator: {ae}")
-
-
-    def get_settings(self):
-        """Get the configured settings"""
-        settings = {}
-        
-        if self.channel_combo.currentText() != 'Auto':
-            settings['channel'] = int(self.channel_combo.currentText())
-            
-        settings['band'] = self.band_combo.currentText()
-        settings['max_clients'] = self.max_clients_spin.value()
-        settings['hidden'] = self.hidden_check.isChecked()
-        
-        return settings
-
-
-class HotspotGUI(QMainWindow):
+class HotspotGUI(QMainWindow): # This is the single, clean definition
     """Main GUI application"""
     
     def __init__(self):
+        if not PYQT5_AVAILABLE:
+            print("CRITICAL: HotspotGUI initialized without PyQt5. This should not happen.", file=sys.stderr)
+            log_error("CRITICAL: HotspotGUI initialized without PyQt5.")
+            super().__init__()
+            return
+
         super().__init__()
-        
-        # Initialize core components
+        self.logger = get_logger(log_file_path=None)
+        log_info("Initializing HotspotGUI...", logger=self.logger)
+
         self.validator = get_validator()
-        self.hotspot_manager = HotspotManager()
-        self.monitor_thread = None
-        self.settings = QSettings('HotspotManager', 'HotspotTool')
-        
-        # Initialize UI
+        self.config_manager = ConfigManager(logger=self.logger)
+        try:
+            self.config_manager.load_config()
+        except Exception as e:
+            log_exception("GUI: Error loading initial configuration.", logger=self.logger)
+            if QApplication.instance():
+                 QMessageBox.critical(self, "Config Error", f"Failed to load configuration: {e}")
+            else:
+                log_error("GUI: QApplication not instantiated for config error.")
+
+        self.firewall_manager = FirewallManager(self.config_manager, logger=self.logger)
+        self.hotspot_manager = HotspotManager(self.config_manager, self.firewall_manager, logger=self.logger)
+
+        user_db_path = self.config_manager.get_config().get('user_database_path', 'hotspot_users.db')
+        self.user_manager = UserManager(db_path=user_db_path, logger=self.logger)
+
+        self.captive_portal = CaptivePortal(self.config_manager, self.user_manager, self.firewall_manager, logger=self.logger)
+        self.bandwidth_manager = BandwidthManager(logger=self.logger)
+        self.network_monitor = NetworkMonitor(logger=self.logger)
+        self.system_monitor = SystemMonitor(logger=self.logger)
+        self.status_logger = StatusLogger(self.config_manager, logger=self.logger)
+        self.service_manager = ServiceManager(logger=self.logger)
+
+        self.is_hotspot_active = False
+        self.current_interface = None
+        self.advanced_settings: dict = {}
+
         self.init_ui()
         self.init_system_tray()
-        
-        # Start monitoring
-        self.start_monitoring()
-        
-        # Load saved settings
         self.load_settings()
-        
-        # Check dependencies
-        self.check_system_requirements()
-    
-    # This class attribute will store settings from the SettingsDialog
-    advanced_settings: Dict = {}
+        self.start_gui_timers()
+
+    def start_gui_timers(self):
+        self.update_timer = QTimer(self)
+        self.update_timer.timeout.connect(self.timed_updates)
+        self.update_timer.start(5000)
+        log_info("GUI: Started UI update timer.", logger=self.logger)
+
+    def timed_updates(self):
+        if self.is_hotspot_active:
+            if hasattr(self, 'refresh_devices_gui'): self.refresh_devices_gui()
+            if self.current_interface and hasattr(self, 'network_traffic_label'):
+                try: # Placeholder for actual traffic monitoring
+                    self.network_traffic_label.setText("Sent: N/A, Received: N/A (Impl Pend)")
+                except Exception: # nosec
+                    self.network_traffic_label.setText("Error fetching traffic")
+        try:
+            cpu = self.system_monitor.get_cpu_usage()
+            mem = self.system_monitor.get_memory_usage()
+            if hasattr(self, 'cpu_usage_label'): self.cpu_usage_label.setText(f"{cpu:.1f}%")
+            if hasattr(self, 'memory_usage_label'): self.memory_usage_label.setText(f"{mem.percent:.1f}% (Used: {mem.used//1024**2:.0f}MB)")
+        except Exception: # nosec
+            if hasattr(self, 'cpu_usage_label'): self.cpu_usage_label.setText("Error")
+            if hasattr(self, 'memory_usage_label'): self.memory_usage_label.setText("Error")
+
+    def load_settings(self):
+        log_info("GUI: Loading settings into UI components...", logger=self.logger)
+        try:
+            config = self.config_manager.get_config()
+
+            # Main Tab
+            if hasattr(self, 'ssid_input'): self.ssid_input.setText(config.get('hotspot_ssid', 'HotterSpot'))
+            if hasattr(self, 'password_input'): self.password_input.setText(config.get('hotspot_password', 'password123'))
+            if hasattr(self, 'interface_combo'):
+                saved_interface = config.get('hotspot_interface')
+                if saved_interface:
+                    index = self.interface_combo.findData(saved_interface) # Assumes data is interface name
+                    if index != -1: self.interface_combo.setCurrentIndex(index)
+            if hasattr(self, 'internet_interface_combo'):
+                saved_sharing_iface = config.get('internet_sharing_source_interface')
+                if saved_sharing_iface:
+                    idx = self.internet_interface_combo.findData(saved_sharing_iface)
+                    if idx != -1: self.internet_interface_combo.setCurrentIndex(idx)
+                elif self.internet_interface_combo.count() > 0: # Default to "None"
+                    none_idx = self.internet_interface_combo.findData(None)
+                    if none_idx != -1: self.internet_interface_combo.setCurrentIndex(none_idx)
+
+
+            # Settings Tab
+            if hasattr(self, 'autostart_gui_checkbox'):
+                self.autostart_gui_checkbox.setChecked(config.get('gui_auto_start_hotspot_on_launch', False))
+            if hasattr(self, 'minimize_tray_check'):
+                 self.minimize_tray_check.setChecked(config.get('gui_minimize_to_tray', False))
+            if hasattr(self, 'save_logs_check'):
+                 self.save_logs_check.setChecked(config.get('save_connection_logs', True))
+
+
+            if hasattr(self, 'captive_portal_checkbox'):
+                cp_enabled = config.get('captive_portal_enabled', False)
+                self.captive_portal_checkbox.setChecked(cp_enabled)
+                if hasattr(self, 'captive_portal_group'): self.captive_portal_group.setEnabled(cp_enabled)
+                if hasattr(self, 'captive_portal_title_input'): self.captive_portal_title_input.setText(config.get('captive_portal_title', 'Welcome to HotterSpot'))
+                if hasattr(self, 'captive_portal_welcome_input'): self.captive_portal_welcome_input.setPlainText(config.get('captive_portal_welcome_message', 'Please accept the terms to connect.'))
+
+
+            if config.get('gui_auto_start_hotspot_on_launch', False) and not self.is_hotspot_active:
+                if hasattr(self, 'start_hotspot_gui'): QTimer.singleShot(100, self.start_hotspot_gui)
+
+        except Exception as e:
+            log_exception("GUI: Error loading settings into UI", logger=self.logger)
+            if QApplication.instance(): # Ensure app exists before showing messagebox
+                QMessageBox.warning(self, "Load Settings Error", f"Could not load all settings: {e}")
+            else:
+                log_error("GUI: QApplication not instantiated, cannot show QMessageBox for Load Settings Error.")
 
     def init_ui(self):
         """Initialize the main user interface"""
-        self.setWindowTitle("Linux Hotspot Manager")
+        self.setWindowTitle(f"{APP_NAME} - Control Panel")
         self.setGeometry(100, 100, 800, 600)
         
-        # Central widget
-        central_widget = QWidget()
+        central_widget = QWidget(self)
         self.setCentralWidget(central_widget)
-        
-        # Main layout
         main_layout = QVBoxLayout(central_widget)
+
+        self.tabs = QTabWidget() # Use self.tabs consistently
+        main_layout.addWidget(self.tabs)
+
+        # Create tab content by calling respective methods
+        # These methods should exist in the class and build the UI for each tab
+        # For example, self.create_main_tab() should populate a QWidget and add it to self.tabs
+        self.create_main_tab() # Assumes this method is defined and works
+        self.create_devices_tab() # Assumes this method is defined
+        # self.create_statistics_tab() # Keep or remove based on new design
+        self.create_settings_tab() # Assumes this method is defined
+
+        # From the new structure, you might have these too:
+        if hasattr(self, 'create_logs_tab'): self.create_logs_tab()
+        if hasattr(self, 'create_system_status_tab'): self.create_system_status_tab()
         
-        # Create tab widget
-        self.tab_widget = QTabWidget()
-        main_layout.addWidget(self.tab_widget)
-        
-        # Create tabs
-        self.create_main_tab()
-        self.create_devices_tab()
-        self.create_statistics_tab()
-        self.create_settings_tab()
-        
-        # Status bar
         self.statusBar().showMessage("Ready")
         
-        # Apply styling
-        self.apply_styling()
+        if hasattr(self, 'apply_styling'): # Check if apply_styling method exists
+            self.apply_styling()
     
     def create_main_tab(self):
         """Create the main control tab"""
@@ -762,77 +497,568 @@ class HotspotGUI(QMainWindow):
         
         layout.addStretch()
         
-        self.tab_widget.addTab(tab, "Settings")
+        self.tabs.addTab(tab, "Settings") # Ensure it's self.tabs (already self.tabs from previous change)
 
-    def apply_settings(self):
-        """Apply general application settings"""
-        self.statusBar().showMessage("Applying settings...")
+    def apply_gui_settings(self): # Renamed from apply_settings
+        """Apply and save settings from the GUI to ConfigManager."""
+        log_info("GUI: Applying and saving settings...", logger=self.logger)
+        try:
+            if hasattr(self, 'autostart_check'):
+                self.config_manager.set_config('gui_auto_start_hotspot_on_launch', self.autostart_check.isChecked())
+            if hasattr(self, 'minimize_tray_check'):
+                self.config_manager.set_config('gui_minimize_to_tray', self.minimize_tray_check.isChecked())
+            if hasattr(self, 'save_logs_check'):
+                 self.config_manager.set_config('save_connection_logs', self.save_logs_check.isChecked())
 
-        # Retrieve settings from GUI elements in the "Settings" tab
-        autostart = self.autostart_check.isChecked()
-        minimize_to_tray = self.minimize_tray_check.isChecked()
-        save_logs = self.save_logs_check.isChecked()
-        mac_filter_enabled = self.mac_filter_check.isChecked() # Example, if this is a setting
-        access_control_enabled = self.access_control_check.isChecked() # Example
+            if hasattr(self, 'captive_portal_checkbox') and hasattr(self, 'captive_portal_title_input') and hasattr(self, 'captive_portal_welcome_input'):
+                cp_enabled = self.captive_portal_checkbox.isChecked()
+                self.config_manager.set_config('captive_portal_enabled', cp_enabled)
+                if cp_enabled:
+                    self.config_manager.set_config('captive_portal_title', self.captive_portal_title_input.text())
+                    self.config_manager.set_config('captive_portal_welcome_message', self.captive_portal_welcome_input.toPlainText())
 
-        # In a real application, these would be validated if they were free-text or complex.
-        # For checkboxes, the value is boolean and inherently valid in terms of type.
-        # If these settings involved text inputs or numeric values, validation would be like:
-        # try:
-        #     validated_log_path = self.validator.validate(self.log_path_edit.text(), 'filename', context="gui_settings_log_path")
-        #     # ... more validations
-        # except ValidationError as e:
-        #     QMessageBox.warning(self, "Input Validation Error", f"Error in application settings:\n{str(e)}")
-        #     self.statusBar().showMessage("Failed to apply settings: Input error.")
-        #     return
+            # Save internet sharing choice
+            if hasattr(self, 'internet_interface_combo') and self.internet_interface_combo is not None:
+                sharing_iface = self.internet_interface_combo.currentData()
+                self.config_manager.set_config('internet_sharing_source_interface', sharing_iface)
 
-        # Save settings using QSettings
-        self.settings.setValue("autostart", autostart)
-        self.settings.setValue("minimizeToTray", minimize_to_tray)
-        self.settings.setValue("saveLogs", save_logs)
-        self.settings.setValue("macFilterEnabled", mac_filter_enabled)
-        self.settings.setValue("accessControlEnabled", access_control_enabled)
 
-        self.statusBar().showMessage("Settings applied successfully.")
-        QMessageBox.information(self, "Settings Applied", "Application settings have been saved.")
+            self.config_manager.save_config()
+            if hasattr(self, 'statusBar'): self.statusBar().showMessage("Settings saved successfully.")
+            log_info("GUI: Settings saved via ConfigManager.", logger=self.logger)
+            if QApplication.instance():
+                QMessageBox.information(self, "Settings Saved", "Configuration has been saved.")
 
-        # Some settings might require immediate action, e.g., enabling/disabling a feature.
-        # For example, if 'save_logs' changed, you might reconfigure a logger.
-        # If autostart changed, you might need to update systemd service or equivalent.
-    
-    def init_system_tray(self):
-        """Initialize system tray icon"""
-        if QSystemTrayIcon.isSystemTrayAvailable():
-            self.tray_icon = QSystemTrayIcon(self)
+            if self.captive_portal.is_running() and hasattr(self, 'captive_portal_checkbox') and self.captive_portal_checkbox.isChecked():
+                 if hasattr(self, 'captive_portal_title_input'): self.captive_portal.title = self.captive_portal_title_input.text()
+                 if hasattr(self, 'captive_portal_welcome_input'): self.captive_portal.welcome_message = self.captive_portal_welcome_input.toPlainText()
+
+        except ValidationError as ve:
+            log_error(f"GUI: Validation error while applying settings: {ve}", logger=self.logger)
+            if QApplication.instance(): QMessageBox.warning(self, "Settings Validation Error", str(ve))
+            if hasattr(self, 'statusBar'): self.statusBar().showMessage("Error saving settings: Validation failed.")
+        except Exception as e:
+            log_exception("GUI: Error applying settings", logger=self.logger)
+            if QApplication.instance(): QMessageBox.critical(self, "Settings Error", f"Failed to save settings: {e}")
+            if hasattr(self, 'statusBar'): self.statusBar().showMessage("Failed to save settings.")
+
+    def start_hotspot_gui(self):
+        if not (hasattr(self, 'ssid_edit') and hasattr(self, 'password_edit') and hasattr(self, 'interface_combo')):
+            log_error("GUI: start_hotspot_gui called, but UI elements are missing.", logger=self.logger)
+            if QApplication.instance(): QMessageBox.critical(self, "UI Error", "Cannot start hotspot: UI components not found.")
+            return
+
+        ssid = self.ssid_edit.text()
+        password = self.password_edit.text()
+        interface = self.interface_combo.currentData()
+
+        try:
+            self.validator.validate('ssid', ssid)
+            self.validator.validate('password', password)
+            if not interface or "No suitable" in str(interface) or "Error loading" in str(interface) :
+                raise ValidationError("A valid network interface must be selected.")
+        except ValidationError as e:
+            if QApplication.instance(): QMessageBox.warning(self, "Input Error", str(e))
+            log_warning(f"GUI: Hotspot start validation error: {e}", logger=self.logger)
+            return
+
+        if hasattr(self, 'start_button'):
+            self.start_button.setEnabled(False)
+            self.start_button.setText("Starting...")
+        if hasattr(self, 'statusBar'): self.statusBar().showMessage(f"Attempting to start hotspot on {interface}...")
+
+        self.hotspot_thread = threading.Thread(target=self._start_hotspot_thread_func,
+                                               args=(ssid, password, interface), daemon=True)
+        self.hotspot_thread.start()
+
+    def _start_hotspot_thread_func(self, ssid, password, interface):
+        try:
+            internet_sharing_source = None
+            if hasattr(self, 'internet_interface_combo') and self.internet_interface_combo is not None:
+                internet_sharing_source = self.internet_interface_combo.currentData()
+                # Internet sharing source is saved by apply_gui_settings if changed there,
+                # or can be saved here if direct start is desired without explicit apply.
+                # For now, assume it's already configured if needed.
+
+            self.hotspot_manager.create_hotspot(ssid, password, interface, internet_sharing_source_iface=internet_sharing_source)
+
+            if self.config_manager.get_config().get('captive_portal_enabled', False):
+                log_info("GUI: Starting captive portal after hotspot creation...", logger=self.logger)
+                self.captive_portal.start_portal()
+
+            self.is_hotspot_active = True
+            self.current_interface = interface
+
+            QMetaObject.invokeMethod(self, "_update_gui_post_start", Qt.QueuedConnection,
+                                     pyqtSignal(str, str).emit(f"Hotspot '{ssid}' is Active on {interface}", "green"))
+        except Exception as e:
+            log_exception("GUI: Failed to start hotspot", logger=self.logger)
+            self.is_hotspot_active = False
+            QMetaObject.invokeMethod(self, "_update_gui_post_start_failure", Qt.QueuedConnection,
+                                     pyqtSignal(str).emit(f"Error: {str(e)}"))
+
+    def _update_gui_post_start(self, status_message, color_name):
+        if hasattr(self, 'status_label'):
+            self.status_label.setText(status_message)
+            self.status_label.setStyleSheet(f"color: {color_name}; font-weight: bold;")
+
+        if hasattr(self, 'start_button'): self.start_button.setEnabled(False)
+        if hasattr(self, 'stop_button'):
+            self.stop_button.setEnabled(True)
+            self.stop_button.setText("Stop Hotspot")
+
+        if hasattr(self, 'statusBar'): self.statusBar().showMessage(status_message)
+
+        if hasattr(self, 'ssid_edit'): self.ssid_edit.setEnabled(False)
+        if hasattr(self, 'password_edit'): self.password_edit.setEnabled(False)
+        if hasattr(self, 'interface_combo'): self.interface_combo.setEnabled(False)
+        if hasattr(self, 'refresh_button'): self.refresh_button.setEnabled(False)
+        if hasattr(self, 'internet_interface_combo'): self.internet_interface_combo.setEnabled(False)
+        if hasattr(self, 'refresh_devices_gui'): self.refresh_devices_gui()
+
+    def _update_gui_post_start_failure(self, error_message):
+        if hasattr(self, 'status_label'):
+            self.status_label.setText(f"Hotspot Status: Failed")
+            self.status_label.setStyleSheet("color: red; font-weight: bold;")
+
+        if hasattr(self, 'start_button'):
+            self.start_button.setEnabled(True)
+            self.start_button.setText("Start Hotspot")
+        if hasattr(self, 'stop_button'): self.stop_button.setEnabled(False)
+
+        if hasattr(self, 'statusBar'): self.statusBar().showMessage(f"Failed to start hotspot: {error_message}")
+        if QApplication.instance(): QMessageBox.critical(self, "Hotspot Error", f"Failed to start hotspot: {error_message}")
+
+        if hasattr(self, 'ssid_edit'): self.ssid_edit.setEnabled(True)
+        if hasattr(self, 'password_edit'): self.password_edit.setEnabled(True)
+        if hasattr(self, 'interface_combo'): self.interface_combo.setEnabled(True)
+        if hasattr(self, 'refresh_button'): self.refresh_button.setEnabled(True)
+        if hasattr(self, 'internet_interface_combo'): self.internet_interface_combo.setEnabled(True)
+
+    def stop_hotspot_gui(self):
+        if hasattr(self, 'stop_button'):
+            self.stop_button.setEnabled(False)
+            self.stop_button.setText("Stopping...")
+        if hasattr(self, 'statusBar'): self.statusBar().showMessage("Attempting to stop hotspot...")
+
+        self.hotspot_thread = threading.Thread(target=self._stop_hotspot_thread_func, daemon=True)
+        self.hotspot_thread.start()
+
+    def _stop_hotspot_thread_func(self):
+        try:
+            if self.captive_portal.is_running():
+                log_info("GUI: Stopping captive portal...", logger=self.logger)
+                self.captive_portal.stop_portal()
+
+            self.hotspot_manager.stop_hotspot() # From the new HotspotManager class
+            self.is_hotspot_active = False
+            self.current_interface = None
+            QMetaObject.invokeMethod(self, "_update_gui_post_stop", Qt.QueuedConnection,
+                                     pyqtSignal(str, str).emit("Hotspot Status: Inactive", "red"))
+        except Exception as e:
+            log_exception("GUI: Failed to stop hotspot", logger=self.logger)
+            QMetaObject.invokeMethod(self, "_update_gui_post_stop_failure", Qt.QueuedConnection,
+                                     pyqtSignal(str).emit(f"Error stopping hotspot: {str(e)}"))
+
+    def _update_gui_post_stop(self, status_message, color_name):
+        if hasattr(self, 'status_label'):
+            self.status_label.setText(status_message)
+            self.status_label.setStyleSheet(f"color: {color_name}; font-weight: bold;")
+
+        if hasattr(self, 'start_button'):
+            self.start_button.setEnabled(True)
+            self.start_button.setText("Start Hotspot")
+        if hasattr(self, 'stop_button'):
+            self.stop_button.setEnabled(False)
+            self.stop_button.setText("Stop Hotspot")
             
-            # Create tray menu
-            tray_menu = QMenu()
+        if hasattr(self, 'statusBar'): self.statusBar().showMessage("Hotspot stopped.")
+
+        if hasattr(self, 'ssid_edit'): self.ssid_edit.setEnabled(True)
+        if hasattr(self, 'password_edit'): self.password_edit.setEnabled(True)
+        if hasattr(self, 'interface_combo'): self.interface_combo.setEnabled(True)
+        if hasattr(self, 'refresh_button'): self.refresh_button.setEnabled(True)
+        if hasattr(self, 'internet_interface_combo'): self.internet_interface_combo.setEnabled(True)
+        if hasattr(self, 'devices_table'): self.devices_table.setRowCount(0)
+
+    def _update_gui_post_stop_failure(self, error_message):
+        if hasattr(self, 'status_label'):
+            self.status_label.setText(f"Hotspot Status: Error Stopping")
+            self.status_label.setStyleSheet("color: orange; font-weight: bold;")
+
+        if hasattr(self, 'stop_button'):
+            self.stop_button.setEnabled(True)
+            self.stop_button.setText("Stop Hotspot")
+        if hasattr(self, 'statusBar'): self.statusBar().showMessage(error_message)
+        if QApplication.instance(): QMessageBox.critical(self, "Hotspot Error", error_message)
+
+    def refresh_devices_gui(self):
+        if not (hasattr(self, 'devices_table') and self.devices_table):
+             log_warning("GUI: refresh_devices_gui called but devices_table is missing.", logger=self.logger)
+             return
+
+        if not self.is_hotspot_active:
+            self.devices_table.setRowCount(0)
+            if hasattr(self, 'connected_count_label'): self.connected_count_label.setText("0") # Assuming this label exists
+            return
+
+        try:
+            # current_interface should be valid if hotspot is active
+            devices = self.hotspot_manager.get_connected_devices(self.current_interface if self.current_interface else "")
+            self.devices_table.setRowCount(len(devices))
+
+            # These headers should match what's set in create_devices_tab
+            # ["IP Address", "MAC Address", "Name", "Actions", "Data Usage"]
+            for row, device in enumerate(devices):
+                ip = device.get('ip', 'N/A')
+                mac = device.get('mac', 'N/A')
+                name = device.get('name', '')
+                if not name or name == mac or name == ip:
+                    name = 'Unknown'
+
+                self.devices_table.setItem(row, 0, QTableWidgetItem(ip))
+                self.devices_table.setItem(row, 1, QTableWidgetItem(mac))
+                self.devices_table.setItem(row, 2, QTableWidgetItem(name))
+
+                # Column 3: Actions (e.g., Block Button)
+                # This column will be populated with a widget in create_devices_tab.
+                # If not, self.devices_table.setItem(row, 3, QTableWidgetItem("N/A"))
+
+                # Column 4: Data Usage
+                if self.devices_table.columnCount() > 4 : # Check if column exists
+                     self.devices_table.setItem(row, 4, QTableWidgetItem(device.get('data_usage', 'N/A')))
+
+
+            if hasattr(self, 'connected_count_label'): self.connected_count_label.setText(str(len(devices)))
+            # Kick button enablement depends on selection, handled by table's itemSelectionChanged signal if any
+            if hasattr(self, 'kick_device_button'): self.kick_device_button.setEnabled(len(devices) > 0)
+
+
+        except Exception as e:
+            log_exception("GUI: Error refreshing device list", logger=self.logger)
+            if QApplication.instance(): QMessageBox.warning(self, "Device Error", f"Could not load connected devices: {e}")
+            self.devices_table.setRowCount(0)
+            if hasattr(self, 'connected_count_label'): self.connected_count_label.setText("0")
+
+    def start_hotspot_gui(self):
+        if not (hasattr(self, 'ssid_edit') and hasattr(self, 'password_edit') and hasattr(self, 'interface_combo')):
+            log_error("GUI: start_hotspot_gui called, but UI elements are missing.", logger=self.logger)
+            if QApplication.instance(): QMessageBox.critical(self, "UI Error", "Cannot start hotspot: UI components not found.")
+            return
+
+        ssid = self.ssid_edit.text()
+        password = self.password_edit.text()
+        interface = self.interface_combo.currentData()
+
+        try:
+            self.validator.validate('ssid', ssid)
+            self.validator.validate('password', password)
+            if not interface or "No suitable" in str(interface) or "Error loading" in str(interface) :
+                raise ValidationError("A valid network interface must be selected.")
+        except ValidationError as e:
+            if QApplication.instance(): QMessageBox.warning(self, "Input Error", str(e))
+            log_warning(f"GUI: Hotspot start validation error: {e}", logger=self.logger)
+            return
+
+        if hasattr(self, 'start_button'):
+            self.start_button.setEnabled(False)
+            self.start_button.setText("Starting...")
+        if hasattr(self, 'statusBar'): self.statusBar().showMessage(f"Attempting to start hotspot on {interface}...")
+
+        self.hotspot_thread = threading.Thread(target=self._start_hotspot_thread_func,
+                                               args=(ssid, password, interface), daemon=True)
+        self.hotspot_thread.start()
+
+    def _start_hotspot_thread_func(self, ssid, password, interface):
+        try:
+            internet_sharing_source = None
+            if hasattr(self, 'internet_interface_combo') and self.internet_interface_combo is not None:
+                internet_sharing_source = self.internet_interface_combo.currentData()
+                # self.config_manager.set_config('internet_sharing_source_interface', internet_sharing_source) # Already saved by apply_gui_settings
+                # self.config_manager.save_config()
+
+            self.hotspot_manager.create_hotspot(ssid, password, interface, internet_sharing_source_iface=internet_sharing_source)
             
-            show_action = QAction("Show", self)
-            show_action.triggered.connect(self.show)
-            tray_menu.addAction(show_action)
+            if self.config_manager.get_config().get('captive_portal_enabled', False):
+                log_info("GUI: Starting captive portal after hotspot creation...", logger=self.logger)
+                self.captive_portal.start_portal()
+
+            self.is_hotspot_active = True
+            self.current_interface = interface
             
-            tray_menu.addSeparator()
+            QMetaObject.invokeMethod(self, "_update_gui_post_start", Qt.QueuedConnection,
+                                     pyqtSignal(str, str).emit(f"Hotspot '{ssid}' is Active on {interface}", "green"))
+        except Exception as e:
+            log_exception("GUI: Failed to start hotspot", logger=self.logger)
+            self.is_hotspot_active = False
+            QMetaObject.invokeMethod(self, "_update_gui_post_start_failure", Qt.QueuedConnection,
+                                     pyqtSignal(str).emit(f"Error: {str(e)}"))
+
+    def _update_gui_post_start(self, status_message, color_name):
+        if hasattr(self, 'status_label'):
+            self.status_label.setText(status_message)
+            self.status_label.setStyleSheet(f"color: {color_name}; font-weight: bold;")
+
+        if hasattr(self, 'start_button'): self.start_button.setEnabled(False)
+        if hasattr(self, 'stop_button'):
+            self.stop_button.setEnabled(True)
+            self.stop_button.setText("Stop Hotspot")
+
+        if hasattr(self, 'statusBar'): self.statusBar().showMessage(status_message)
+
+        if hasattr(self, 'ssid_edit'): self.ssid_edit.setEnabled(False)
+        if hasattr(self, 'password_edit'): self.password_edit.setEnabled(False)
+        if hasattr(self, 'interface_combo'): self.interface_combo.setEnabled(False)
+        if hasattr(self, 'refresh_button'): self.refresh_button.setEnabled(False)
+        if hasattr(self, 'internet_interface_combo'): self.internet_interface_combo.setEnabled(False)
+        if hasattr(self, 'refresh_devices_gui'): self.refresh_devices_gui()
+
+    def _update_gui_post_start_failure(self, error_message):
+        if hasattr(self, 'status_label'):
+            self.status_label.setText(f"Hotspot Status: Failed")
+            self.status_label.setStyleSheet("color: red; font-weight: bold;")
+
+        if hasattr(self, 'start_button'):
+            self.start_button.setEnabled(True)
+            self.start_button.setText("Start Hotspot")
+        if hasattr(self, 'stop_button'): self.stop_button.setEnabled(False)
+
+        if hasattr(self, 'statusBar'): self.statusBar().showMessage(f"Failed to start hotspot: {error_message}")
+        if QApplication.instance(): QMessageBox.critical(self, "Hotspot Error", f"Failed to start hotspot: {error_message}")
+
+        if hasattr(self, 'ssid_edit'): self.ssid_edit.setEnabled(True)
+        if hasattr(self, 'password_edit'): self.password_edit.setEnabled(True)
+        if hasattr(self, 'interface_combo'): self.interface_combo.setEnabled(True)
+        if hasattr(self, 'refresh_button'): self.refresh_button.setEnabled(True)
+        if hasattr(self, 'internet_interface_combo'): self.internet_interface_combo.setEnabled(True)
+
+    def stop_hotspot_gui(self):
+        if hasattr(self, 'stop_button'):
+            self.stop_button.setEnabled(False)
+            self.stop_button.setText("Stopping...")
+        if hasattr(self, 'statusBar'): self.statusBar().showMessage("Attempting to stop hotspot...")
+
+        self.hotspot_thread = threading.Thread(target=self._stop_hotspot_thread_func, daemon=True)
+        self.hotspot_thread.start()
+
+    def _stop_hotspot_thread_func(self):
+        try:
+            if self.captive_portal.is_running():
+                log_info("GUI: Stopping captive portal...", logger=self.logger)
+                self.captive_portal.stop_portal()
             
-            start_action = QAction("Start Hotspot", self)
-            start_action.triggered.connect(self.start_hotspot)
-            tray_menu.addAction(start_action)
+            self.hotspot_manager.stop_hotspot()
+            self.is_hotspot_active = False
+            self.current_interface = None
+            QMetaObject.invokeMethod(self, "_update_gui_post_stop", Qt.QueuedConnection,
+                                     pyqtSignal(str, str).emit("Hotspot Status: Inactive", "red"))
+        except Exception as e:
+            log_exception("GUI: Failed to stop hotspot", logger=self.logger)
+            QMetaObject.invokeMethod(self, "_update_gui_post_stop_failure", Qt.QueuedConnection,
+                                     pyqtSignal(str).emit(f"Error stopping hotspot: {str(e)}"))
+
+    def _update_gui_post_stop(self, status_message, color_name):
+        if hasattr(self, 'status_label'):
+            self.status_label.setText(status_message)
+            self.status_label.setStyleSheet(f"color: {color_name}; font-weight: bold;")
+
+        if hasattr(self, 'start_button'):
+            self.start_button.setEnabled(True)
+            self.start_button.setText("Start Hotspot")
+        if hasattr(self, 'stop_button'):
+            self.stop_button.setEnabled(False)
+            self.stop_button.setText("Stop Hotspot")
             
-            stop_action = QAction("Stop Hotspot", self)
-            stop_action.triggered.connect(self.stop_hotspot)
-            tray_menu.addAction(stop_action)
+        if hasattr(self, 'statusBar'): self.statusBar().showMessage("Hotspot stopped.")
+
+        if hasattr(self, 'ssid_edit'): self.ssid_edit.setEnabled(True)
+        if hasattr(self, 'password_edit'): self.password_edit.setEnabled(True)
+        if hasattr(self, 'interface_combo'): self.interface_combo.setEnabled(True)
+        if hasattr(self, 'refresh_button'): self.refresh_button.setEnabled(True)
+        if hasattr(self, 'internet_interface_combo'): self.internet_interface_combo.setEnabled(True)
+        if hasattr(self, 'devices_table'): self.devices_table.setRowCount(0)
+
+    def _update_gui_post_stop_failure(self, error_message):
+        if hasattr(self, 'status_label'):
+            self.status_label.setText(f"Hotspot Status: Error Stopping")
+            self.status_label.setStyleSheet("color: orange; font-weight: bold;")
+
+        if hasattr(self, 'stop_button'):
+            self.stop_button.setEnabled(True)
+            self.stop_button.setText("Stop Hotspot")
+        if hasattr(self, 'statusBar'): self.statusBar().showMessage(error_message)
+        if QApplication.instance(): QMessageBox.critical(self, "Hotspot Error", error_message)
+
+    def refresh_devices_gui(self):
+        if not (hasattr(self, 'devices_table') and self.devices_table):
+             log_warning("GUI: refresh_devices_gui called but devices_table is missing.", logger=self.logger)
+             return
+
+        if not self.is_hotspot_active:
+            self.devices_table.setRowCount(0)
+            if hasattr(self, 'connected_count_label'): self.connected_count_label.setText("0")
+            return
+
+        try:
+            devices = self.hotspot_manager.get_connected_devices(self.current_interface if self.current_interface else "")
+            self.devices_table.setRowCount(len(devices))
+            for row, device in enumerate(devices):
+                ip = device.get('ip', 'N/A')
+                mac = device.get('mac', 'N/A')
+                name = device.get('name', '')
+                if not name or name == mac or name == ip:
+                    name = 'Unknown'
+
+                self.devices_table.setItem(row, 0, QTableWidgetItem(ip))
+                self.devices_table.setItem(row, 1, QTableWidgetItem(mac))
+                self.devices_table.setItem(row, 2, QTableWidgetItem(name))
+
+                # Column 3 for Actions (placeholder text, actual widget in create_devices_tab)
+                # Example: self.devices_table.setItem(row, 3, QTableWidgetItem("Block"))
+
+                # Column 4 for Data Usage - ensure this column exists in create_devices_tab
+                if self.devices_table.columnCount() > 4:
+                    self.devices_table.setItem(row, 4, QTableWidgetItem(device.get('data_usage', 'N/A')))
+
+
+            if hasattr(self, 'connected_count_label'): self.connected_count_label.setText(str(len(devices)))
+            if hasattr(self, 'kick_device_button'): self.kick_device_button.setEnabled(len(devices) > 0 and bool(self.devices_table.selectedItems()))
+
+        except Exception as e:
+            log_exception("GUI: Error refreshing device list", logger=self.logger)
+            if QApplication.instance(): QMessageBox.warning(self, "Device Error", f"Could not load connected devices: {e}")
+            self.devices_table.setRowCount(0)
+            if hasattr(self, 'connected_count_label'): self.connected_count_label.setText("0")
+
+    # This should remove the last duplicated block of stop_hotspot_gui and refresh_devices_gui
+
+    def kick_selected_device(self): # This method is already up-to-date from a previous step
+        if not (hasattr(self, 'devices_table') and self.devices_table):
+            log_warning("GUI: kick_selected_device called but devices_table is missing.", logger=self.logger)
+            return
+
+        selected_items = self.devices_table.selectedItems()
+        if not selected_items :
+            if QApplication.instance(): QMessageBox.information(self, "No Device Selected", "Please select a device from the table.")
+            return
+
+        row_index = selected_items[0].row()
+        # MAC Address is in column 1, make sure create_devices_tab sets this up.
+        mac_item = self.devices_table.item(row_index, 1)
+
+        if not mac_item or not mac_item.text():
+             if QApplication.instance(): QMessageBox.warning(self, "MAC Not Found", "Could not retrieve MAC address for the selected device.")
+             return
+        mac_address = mac_item.text()
+
+        identifier_item = self.devices_table.item(row_index, 0) # IP/Name is column 0
+        device_identifier = identifier_item.text() if identifier_item else mac_address
+
+        reply = QMessageBox.question(self, "Block Device",
+                                     f"Are you sure you want to block device '{device_identifier}' ({mac_address})?",
+                                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply == QMessageBox.Yes:
+            try:
+                self.firewall_manager.block_mac_address(mac_address)
+                log_info(f"GUI: Manually blocked MAC: {mac_address}", logger=self.logger)
+                if QApplication.instance(): QMessageBox.information(self, "Device Blocked", f"Device {mac_address} blocked successfully.")
+                if hasattr(self, 'refresh_devices_gui'): self.refresh_devices_gui()
+            except Exception as e:
+                log_exception(f"GUI: Error blocking MAC {mac_address}", logger=self.logger)
+                if QApplication.instance(): QMessageBox.critical(self, "Blocking Error", f"Failed to block device: {e}")
+
+    def init_system_tray(self): # This is the new version of init_system_tray
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            log_warning("GUI: System tray not available on this system.", logger=self.logger)
+            return
+
+        self.tray_icon = QSystemTrayIcon(self)
+        try:
+            # Standard way to reference package resources is more complex (e.g. via importlib.resources)
+            # For simplicity, assuming icon.png is discoverable relative to the script.
+            # A better approach would be to use Qt's resource system (qrc files).
+            base_dir = os.path.dirname(os.path.abspath(__file__)) # Gets dir of current script
+            app_icon_path = os.path.join(base_dir, 'icon.png') # Placeholder for actual icon path or resource name
             
-            tray_menu.addSeparator()
+            if not os.path.exists(app_icon_path):
+                log_warning(f"Icon not found at {app_icon_path}, attempting theme icon or default.", logger=self.logger)
+                # Try to get a generic network icon from theme as a fallback
+                app_icon = QIcon.fromTheme("network-wireless", self.style().standardIcon(QStyle.SP_NetworkWirelessEnabled))
+                if app_icon.isNull() or app_icon.name() == "network-wireless": # If theme icon not found or generic
+                     app_icon = self.style().standardIcon(QStyle.SP_ApplicationIcon) # Ultimate fallback
+            else:
+                app_icon = QIcon(app_icon_path)
             
-            quit_action = QAction("Quit", self)
-            quit_action.triggered.connect(self.close)
-            tray_menu.addAction(quit_action)
+            if app_icon.isNull(): # Check if any icon was successfully loaded
+                log_error("Setting window icon to a null QIcon. Using default style's application icon.", logger=self.logger)
+                app_icon = self.style().standardIcon(QStyle.SP_ApplicationIcon) # Final fallback
             
-            self.tray_icon.setContextMenu(tray_menu)
-            self.tray_icon.show()
+            self.setWindowIcon(app_icon) # Set for the main window too
+            self.tray_icon.setIcon(app_icon)
+        except Exception as e:
+            log_exception(f"GUI: Failed to load or set icon: {e}", logger=self.logger)
+            if hasattr(self, 'style') and callable(self.style): # Ensure self.style() is valid
+                 self.tray_icon.setIcon(self.style().standardIcon(QStyle.SP_ApplicationIcon))
+
+        tray_menu = QMenu(self) # Parent menu to self for proper cleanup
+
+        show_action = QAction("Show Window", self)
+        show_action.triggered.connect(self.show_window_and_raise) # showNormal + activateWindow
+        tray_menu.addAction(show_action)
+
+        tray_menu.addSeparator()
+
+        start_gui_action = QAction("Start Hotspot", self)
+        if hasattr(self, 'start_hotspot_gui'): start_gui_action.triggered.connect(self.start_hotspot_gui)
+        tray_menu.addAction(start_gui_action)
+
+        stop_gui_action = QAction("Stop Hotspot", self)
+        if hasattr(self, 'stop_hotspot_gui'): stop_gui_action.triggered.connect(self.stop_hotspot_gui)
+        tray_menu.addAction(stop_gui_action)
+
+        tray_menu.addSeparator()
+
+        quit_action = QAction("Quit HotterSpot", self) # More specific title
+        # Use close_application_logic to bypass QCloseEvent prompt if desired from tray
+        if hasattr(self, 'close_application_logic'):
+            quit_action.triggered.connect(lambda: self.close_application_logic(from_tray=True))
+        else:
+            quit_action.triggered.connect(self.close) # Fallback to standard close (will show prompt)
+        tray_menu.addAction(quit_action)
+
+        self.tray_icon.setContextMenu(tray_menu)
+        self.tray_icon.activated.connect(self.tray_icon_activated) # Handle clicks on tray icon
+        self.tray_icon.show()
+        log_info("GUI: System tray icon initialized and shown.", logger=self.logger)
+
+    def tray_icon_activated(self, reason):
+        """Handle tray icon activation (click, double click)."""
+        if reason == QSystemTrayIcon.DoubleClick or reason == QSystemTrayIcon.Trigger: # Single or Double click
+            self.show_window_and_raise()
+
+    def show_window_and_raise(self):
+        """Utility to show, de-minimize, and raise the window."""
+        self.showNormal() # De-minimize if minimized
+        self.raise_() # Raise to top (platform dependent)
+        self.activateWindow() # Bring focus (platform dependent)
+
+    def toggle_password_visibility(self, checked): # Assuming self.password_edit exists
+        if hasattr(self, 'password_edit'):
+            self.password_edit.setEchoMode(QLineEdit.Normal if checked else QLineEdit.Password)
+        else:
+            log_warning("GUI: toggle_password_visibility called but password_edit not found.", logger=self.logger)
+
+    def show_advanced_settings(self): # Placeholder, already updated
+        log_info("GUI: 'Advanced Settings' button clicked. Placeholder action.", logger=self.logger)
+        if QApplication.instance():
+            QMessageBox.information(self, "Advanced Settings",
+                                    "Advanced configuration is managed via the main settings tab "
+                                    "and the configuration file directly for now.")
     
     def apply_styling(self):
         """Apply modern styling to the application"""
+        # Content of apply_styling is kept from original for now.
+        # Review if UI elements change significantly.
         self.setStyleSheet("""
             QMainWindow {
                 background-color: #f0f0f0;
@@ -919,31 +1145,71 @@ class HotspotGUI(QMainWindow):
                 border-bottom: 2px solid #4CAF50;
             }
         """)
-    
-    def check_system_requirements(self):
-        """Check if system has required dependencies"""
-        success, missing = self.hotspot_manager.check_dependencies()
-        
-        if not success:
-            msg = QMessageBox()
-            msg.setIcon(QMessageBox.Warning)
-            msg.setWindowTitle("Missing Dependencies")
-            msg.setText("Some required tools are missing:")
-            msg.setDetailedText("Missing tools:\n" + "\n".join(missing) + 
-                              "\n\nPlease install them using your package manager.")
-            msg.exec_()
-    
+
     def refresh_interfaces(self):
-        """Refresh available network interfaces"""
-        # WiFi interfaces
-        wifi_interfaces = NetworkInterface.get_wireless_interfaces()
+        """Refresh available network interfaces using HotspotManager."""
+        if not hasattr(self, 'interface_combo') or self.interface_combo is None:
+            log_warning("GUI: refresh_interfaces called but interface_combo is None or missing.", logger=self.logger)
+            return
+
         self.interface_combo.clear()
-        self.interface_combo.addItems(wifi_interfaces)
+        selected_index = 0
         
-        # Internet interfaces
-        ethernet_interfaces = NetworkInterface.get_ethernet_interfaces()
-        all_interfaces = wifi_interfaces + ethernet_interfaces
-        
-        self.internet_interface_combo.clear()
-        self.internet_interface_combo.addItem("None")
-        self.internet_interface_combo.addItems(all
+        try:
+            interfaces_data = self.hotspot_manager.get_available_interfaces()
+            all_ifaces_display = []
+            all_ifaces_data = []
+
+            if interfaces_data.get('wireless'):
+                for iface in interfaces_data['wireless']:
+                    all_ifaces_display.append(f"{iface} (Wireless)")
+                    all_ifaces_data.append(iface)
+            if interfaces_data.get('ethernet'):
+                for iface in interfaces_data['ethernet']:
+                     all_ifaces_display.append(f"{iface} (Ethernet - Advanced)")
+                     all_ifaces_data.append(iface)
+
+            if not all_ifaces_data:
+                self.interface_combo.addItem("No suitable interfaces found")
+                self.interface_combo.setEnabled(False)
+                if hasattr(self, 'start_button'): self.start_button.setEnabled(False)
+            else:
+                current_config_interface = self.config_manager.get_config().get('hotspot_interface')
+                for i, iface_data in enumerate(all_ifaces_data):
+                    self.interface_combo.addItem(all_ifaces_display[i], iface_data)
+                    if iface_data == current_config_interface:
+                        selected_index = i
+                self.interface_combo.setCurrentIndex(selected_index)
+                self.interface_combo.setEnabled(True)
+                if hasattr(self, 'start_button'): self.start_button.setEnabled(not self.is_hotspot_active)
+            log_info(f"GUI: Refreshed interfaces. Found: {all_ifaces_data}", logger=self.logger)
+
+        except Exception as e:
+            log_exception("GUI: Error refreshing interfaces", logger=self.logger)
+            if QApplication.instance(): QMessageBox.warning(self, "Interface Error", f"Could not load network interfaces: {e}")
+            self.interface_combo.addItem("Error loading interfaces")
+            self.interface_combo.setEnabled(False)
+            if hasattr(self, 'start_button'): self.start_button.setEnabled(False)
+
+        if hasattr(self, 'internet_interface_combo'):
+            self.internet_interface_combo.clear()
+            self.internet_interface_combo.addItem("None (Do Not Share)", None)
+            try:
+                import netifaces # Keep import local if only used here
+                sys_interfaces = netifaces.interfaces()
+                current_hotspot_iface_data = self.interface_combo.currentData()
+
+                for iface_name in sys_interfaces:
+                    if current_hotspot_iface_data and iface_name == current_hotspot_iface_data:
+                        continue
+                    self.internet_interface_combo.addItem(iface_name, iface_name)
+
+                saved_inet_iface = self.config_manager.get_config().get('internet_sharing_source_interface')
+                if saved_inet_iface:
+                    idx = self.internet_interface_combo.findData(saved_inet_iface)
+                    if idx != -1: self.internet_interface_combo.setCurrentIndex(idx)
+                elif self.internet_interface_combo.count() > 0:
+                    none_idx = self.internet_interface_combo.findData(None)
+                    if none_idx != -1: self.internet_interface_combo.setCurrentIndex(none_idx)
+            except Exception as e:
+                log_warning(f"GUI: Could not populate internet_interface_combo: {e}", logger=self.logger)

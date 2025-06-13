@@ -82,7 +82,8 @@ class ConfigManager:
                 'enabled': True,
                 'level': 'INFO',
                 'file': 'hotspot.log'
-            }
+            },
+            'auto_start_on_daemon_launch': True
         }
         
 
@@ -110,6 +111,7 @@ class ConfigManager:
             # dnsmasq_extra_options is a list of strings.
             'captive_portal_enabled': 'user_input', # boolean
             'local_domain_name': 'user_input', # or a 'hostname' like rule if available
+            'auto_start_on_daemon_launch': 'user_input', # Expects boolean
             # bandwidth_limit and logging are dicts, would need separate validation or rule enhancements.
         }
 

@@ -101,6 +101,10 @@ remove_files() {
     log "Removing HotterSpot application files and configurations..."
 
     # Remove main installation directory (contains app, libs, venv)
+    if [ -f "$INSTALL_DIR/hotterspot_daemon.py" ]; then
+        log "Removing daemon script: $INSTALL_DIR/hotterspot_daemon.py"
+        rm -f "$INSTALL_DIR/hotterspot_daemon.py"
+    fi
     if [ -d "$INSTALL_DIR" ]; then
         log "Removing installation directory: $INSTALL_DIR"
         rm -rf "$INSTALL_DIR"
