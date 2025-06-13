@@ -1,0 +1,119 @@
+/* hotspot_dashboard.css */
+
+/* Global Font */
+body {
+  font-family: 'Roboto', sans-serif;
+}
+
+/* Scrollbar Styling for Console */
+#console-output::-webkit-scrollbar {
+  width: 8px;
+}
+#console-output::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.2);
+  border-radius: 4px;
+}
+
+/* Sidebar Links & Buttons */
+.sidebar button, .sidebar a {
+  color: #fff;
+  background: transparent;
+  border: none;
+  width: 100%;
+  text-align: left;
+}
+
+/* Card Backdrop Glassmorphism */
+.glow-card {
+  position: relative;
+  overflow: hidden;
+}
+.glow-card::before {
+  content: '';
+  position: absolute;
+  top: -50%; left: -50%;
+  width: 200%; height: 200%;
+  background: radial-gradient(circle, rgba(255,0,255,0.2), transparent 70%);
+  animation: rotate-glow 6s linear infinite;
+}
+
+@keyframes rotate-glow {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+.glow-card > * {
+  position: relative;
+  z-index: 1;
+}
+
+/* Neon Accent Underlines */
+header h1::after {
+  content: '';
+  display: block;
+  width: 50px;
+  height: 4px;
+  background: #ff00ff;
+  margin-top: 4px;
+  box-shadow: 0 0 8px #ff00ff;
+}
+
+/* Button Transitions */
+button, input, select {
+  transition: all 0.2s ease-in-out;
+}
+
+button:hover {
+  transform: scale(1.05);
+}
+
+/* Chart Container */
+#bandwidthChart {
+  background: rgba(0, 0, 0, 0.2);
+  border-radius: 8px;
+  padding: 10px;
+}
+
+/* Console Styling */
+#console-output {
+  background: rgba(0, 0, 0, 0.6);
+  color: #0f0;
+  line-height: 1.4;
+  font-size: 0.9em;
+}
+
+#console-input {
+  background: rgba(0, 0, 0, 0.8);
+  color: #fff;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+}
+#send-command {
+  background: #0f0;
+  color: #000;
+}
+
+/* Status Indicator */
+#status-indicator i {
+  font-size: 0.8em;
+  transition: color 0.3s;
+}
+#status-indicator.active i {
+  color: #00ff00;
+  animation: pulse 2s infinite;
+}
+
+/* Utility Neon Text */
+.neon-text {
+  color: #fff;
+  text-shadow: 0 0 4px #fff, 0 0 8px #ff00ff, 0 0 12px #ff00ff;
+}
+
+/* Responsive Fixes */
+@media (max-width: 768px) {
+  .sidebar {
+    width: 60px;
+  }
+  .sidebar span, .sidebar .neon-text {
+    display: none;
+  }
+}

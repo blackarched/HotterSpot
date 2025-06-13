@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Hotspot Manager Dashboard</title>
+  <!-- Tailwind CSS -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- Font Awesome -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" />
+  <!-- Chart.js -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <!-- Socket.IO client -->
+  <script src="/socket.io/socket.io.js"></script>
+  <!-- Custom CSS -->
+  <link rel="stylesheet" href="hotspot_dashboard.css" />
+  <style>
+    /* Neon glow keyframes */
+    @keyframes neon-flicker {
+      0%, 19%, 21%, 23%, 25%, 54%, 56%, 100% { opacity: 1; text-shadow: 0 0 4px #fff, 0 0 10px #f0f, 0 0 20px #f0f, 0 0 30px #f0f; }
+      20%, 24%, 55% { opacity: 0.5; text-shadow: none; }
+    }
+    body {
+      background: radial-gradient(circle at top right, #0f0c29, #302b63, #24243e);
+    }
+    .neon-text {
+      animation: neon-flicker 2s infinite;
+    }
+    .glow-card {
+      background: rgba(255,255,255,0.05);
+      backdrop-filter: blur(10px);
+      box-shadow: 0 0 10px rgba(255,0,255,0.2), 0 0 20px rgba(0,255,255,0.2);
+    }
+    .sidebar a:hover, .sidebar button:hover {
+      background: rgba(255,0,255,0.2);
+      box-shadow: 0 0 8px #ff00ff;
+    }
+    #status-indicator.active i {
+      color: #0f0;
+      animation: pulse 2s infinite;
+    }
+    @keyframes pulse {
+      0% { transform: scale(1); }
+      50% { transform: scale(1.2); }
+      100% { transform: scale(1); }
+    }
+  </style>
+</head>
+<body class="min-h-screen text-white flex font-sans">
+  <!-- Sidebar -->
+  <aside class="sidebar w-20 md:w-64 p-4 flex-shrink-0 flex flex-col bg-black/30 backdrop-blur-lg">
+    <div class="flex items-center mb-8">
+      <i class="fas fa-wifi text-3xl text-pink-500 neon-text"></i>
+      <span class="ml-3 text-2xl font-extrabold hidden md:block neon-text">Hotspot</span>
+    </div>
+    <nav class="flex-1 space-y-3">
+      <button class="w-full flex items-center p-3 rounded-lg transition-all sidebar hover:scale-105" data-action="start-hotspot">
+        <i class="fas fa-play w-6 text-center text-green-400"></i>
+        <span class="ml-3 hidden md:block">Start Hotspot</span>
+      </button>
+      <button class="w-full flex items-center p-3 rounded-lg transition-all sidebar hover:scale-105" data-action="stop-hotspot">
+        <i class="fas fa-stop w-6 text-center text-red-400"></i>
+        <span class="ml-3 hidden md:block">Stop Hotspot</span>
+      </button>
+      <button class="w-full flex items-center p-3 rounded-lg transition-all sidebar hover:scale-105" data-action="view-devices">
+        <i class="fas fa-users w-6 text-center text-blue-400"></i>
+        <span class="ml-3 hidden md:block">Devices</span>
+      </button>
+      <button class="w-full flex items-center p-3 rounded-lg transition-all sidebar hover:scale-105" data-action="view-usage">
+        <i class="fas fa-tachometer-alt w-6 text-center text-yellow-400"></i>
+        <span class="ml-3 hidden md:block">Usage</span>
+      </button>
+      <button class="w-full flex items-center p-3 rounded-lg transition-all sidebar hover:scale-105" data-action="configure-hotspot">
+        <i class="fas fa-cogs w-6 text-center text-purple-400"></i>
+        <span class="ml-3 hidden md:block">Settings</span>
+      </button>
+      <button class="w-full flex items-center p-3 rounded-lg transition-all sidebar hover:scale-105" data-action="view-logs">
+        <i class="fas fa-file-alt w-6 text-center text-gray-400"></i>
+        <span class="ml-3 hidden md:block">Logs</span>
+      </button>
+    </nav>
+    <div class="mt-auto text-center text-xs text-gray-500">
+      <div>© 2025 Hotspot Tool</div>
+    </div>
+  </aside>
+
+  <!-- Main Content -->
+  <main class="flex-1 overflow-y-auto p-6 space-y-6">
+    <!-- Header -->
+    <header class="flex items-center justify-between">
+      <h1 class="text-3xl font-extrabold neon-text">Hotspot Manager</h1>
+      <div id="status-indicator" class="flex items-center space-x-2">
+        <i class="fas fa-circle text-gray-600"></i>
+        <span class="text-sm">Idle</span>
+      </div>
+    </header>
+
+    <!-- Dashboard Cards -->
+    <section class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+      <div class="glow-card rounded-lg p-5 transition-transform hover:scale-105">
+        <p class="text-sm text-gray-300">Hotspot Status</p>
+        <h3 id="card-hotspot-status" class="text-2xl font-bold neon-text mt-2">Stopped</h3>
+      </div>
+      <div class="glow-card rounded-lg p-5 transition-transform hover:scale-105">
+        <p class="text-sm text-gray-300">Connected Devices</p>
+        <h3 id="card-device-count" class="text-2xl font-bold neon-text mt-2">0</h3>
+      </div>
+      <div class="glow-card rounded-lg p-5 transition-transform hover:scale-105">
+        <p class="text-sm text-gray-300">Upload Speed</p>
+        <h3 id="card-upload" class="text-2xl font-bold neon-text mt-2">0 Mbps</h3>
+      </div>
+      <div class="glow-card rounded-lg p-5 transition-transform hover:scale-105">
+        <p class="text-sm text-gray-300">Download Speed</p>
+        <h3 id="card-download" class="text-2xl font-bold neon-text mt-2">0 Mbps</h3>
+      </div>
+    </section>
+
+    <!-- Charts & Console -->
+    <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+      <div class="lg:col-span-2 glow-card rounded-lg p-6">
+        <h2 class="text-xl font-semibold neon-text mb-4">Bandwidth Over Time</h2>
+        <canvas id="bandwidthChart" height="200"></canvas>
+      </div>
+
+      <div class="glow-card rounded-lg flex flex-col">
+        <div class="p-4 border-b border-gray-700 flex justify-between">
+          <span class="font-semibold">Console</span>
+          <button id="clear-console" class="text-xs text-gray-400 hover:text-white">Clear</button>
+        </div>
+        <div id="console-output" class="p-4 overflow-y-auto flex-1 font-mono text-sm bg-black/40"></div>
+        <div class="p-4 border-t border-gray-700 flex">
+          <input id="console-input" type="text" placeholder="Enter command..." class="flex-1 bg-black/60 border border-gray-600 rounded px-3 py-2 text-sm focus:outline-none" />
+          <button id="send-command" class="ml-2 px-4 py-2 bg-green-600 rounded-lg hover:bg-green-500 transition-all">Send</button>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <!-- Hotspot Dashboard Script -->
+  <script src="hotspot_dashboard.js"></script>
+</body>
+</html>
